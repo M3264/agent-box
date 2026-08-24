@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent Hub persistent multi-agent control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/agent-hub
+ExecStart=/home/ubuntu/agent-hub/start.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

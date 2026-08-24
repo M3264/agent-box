@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Data — runtime state and archived snapshots
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db.bak-*
+data/workspaces/
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# Vite build output, served by FastAPI
+static/assets/
+
+# Local env / secrets
+.env
+*.env
+!.env.example
