@@ -17,13 +17,23 @@ import { text, time } from '../../lib/format'
 import type { JobEvent, JobMessage } from '../../types'
 
 /** Event kinds that belong in a conversation, as opposed to the full timeline. */
-const SPOKEN = new Set(['message', 'result', 'handoff', 'guidance', 'notice', 'plan', 'error', 'approval'])
+const SPOKEN = new Set([
+  'message',
+  'result',
+  'handoff',
+  'guidance',
+  'notice',
+  'plan',
+  'error',
+  'approval',
+  'tool_call',
+])
 
 interface Turn {
   id: number
   at: number
   who: string
-  variant: 'agent' | 'operator' | 'result' | 'note'
+  variant: 'agent' | 'operator' | 'result' | 'note' | 'command'
   context: string | null
   body: string
 }
@@ -91,6 +101,26 @@ function toTurn(event: JobEvent): Turn | null {
         context: null,
         body: text(payload.message),
       }
+    case 'tool_call': {
+      // Rendered inline rather than only in the Commands tab: what makes this read
+      // like a CLI session is seeing the command between the two things the agent
+      // said around it.
+      const exit = payload.exit_code
+      const suffix =
+        payload.status === 'ok'
+          ? ''
+          : typeof exit === 'number'
+            ? ` → exit ${exit}`
+            : ` → ${text(payload.status)}`
+      return {
+        id: event.id,
+        at: event.created_at,
+        who,
+        variant: 'command',
+        context: typeof payload.phase === 'string' ? payload.phase : null,
+        body: `$ ${text(payload.display)}${suffix}`,
+      }
+    }
     case 'error':
       return {
         id: event.id,
@@ -171,6 +201,12 @@ export function Conversation({ jobId, events, messages, live, onSent }: Props) {
               <p key={turn.id} className="turn-note">
                 <span className="turn-note-time">{time(turn.at)}</span>
                 {turn.body}
+              </p>
+            ) : turn.variant === 'command' ? (
+              <p key={turn.id} className="turn-command">
+                <span className="turn-note-time">{time(turn.at)}</span>
+                <span className="turn-command-who">{turn.who}</span>
+                <code>{turn.body}</code>
               </p>
             ) : (
               <article key={turn.id} className={`turn turn-${turn.variant}`}>

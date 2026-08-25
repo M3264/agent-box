@@ -15,6 +15,7 @@ from app.deps import db, engine, events, require_job
 from app.logging_setup import get_logger
 from app.models import JobAction, JobCreate, MessageCreate
 from app.orchestrator.roles import load_team, resolve_team_id
+from app.orchestrator.sandbox import status as sandbox_status
 from app.streams import job_event_stream
 
 log = get_logger("agent_hub.api.jobs")
@@ -27,6 +28,13 @@ JobId = Annotated[str, Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-
 
 ARTIFACT_COLUMNS = (
     "id,job_id,phase_id,agent,name,mime_type,length(content) as size,created_at"
+)
+
+#: The Commands list never needs the captured output — a job with a few hundred
+#: commands would otherwise ship megabytes of logs into a snapshot.
+TOOL_CALL_COLUMNS = (
+    "id,job_id,phase_id,turn,agent,tool,args,status,exit_code,truncated,sandbox,"
+    "approval_id,duration_ms,created_at,started_at,finished_at"
 )
 
 
@@ -51,6 +59,13 @@ def _phase_dict(row: Any) -> dict[str, Any]:
     phase["depends_on"] = _json_column(phase.get("depends_on"), [])
     phase["requires_approval"] = bool(phase.get("requires_approval"))
     return phase
+
+
+def _tool_call_dict(row: Any) -> dict[str, Any]:
+    call = dict(row)
+    call["args"] = _json_column(call.get("args"), {})
+    call["truncated"] = bool(call.get("truncated"))
+    return call
 
 
 async def _action(job_id: str) -> JobAction:
@@ -88,12 +103,33 @@ async def create_job(payload: JobCreate) -> dict[str, Any]:
     workspace = settings.workspace_root / job_id
     workspace.mkdir(parents=True, exist_ok=True)
 
+    # Refused here as well as in the engine. The engine check is the real guarantee
+    # (nothing runs in a backend the operator did not choose), but a 400 at creation
+    # tells the operator *why* instead of handing them a job that dies on its first
+    # phase. `None` is not checked: it resolves to the server default when the job
+    # starts, which may be different by then.
+    if payload.sandbox is not None:
+        state = sandbox_status().get(payload.sandbox)
+        if state is not None and not state.available:
+            raise HTTPException(
+                status_code=400,
+                detail=f"the '{payload.sandbox}' sandbox is not available on this host: {state.reason}",
+            )
+
     async with db.transaction() as conn:
         await conn.execute(
             "insert into jobs(id,task,team_id,provider_id,mode,status,paused,workspace,"
-            "created_at,updated_at)"
-            " values(?,?,?,?,?,'queued',0,?,unixepoch('subsec'),unixepoch('subsec'))",
-            (job_id, payload.task, team_id, payload.provider_id, payload.mode, str(workspace)),
+            "sandbox,created_at,updated_at)"
+            " values(?,?,?,?,?,'queued',0,?,?,unixepoch('subsec'),unixepoch('subsec'))",
+            (
+                job_id,
+                payload.task,
+                team_id,
+                payload.provider_id,
+                payload.mode,
+                str(workspace),
+                payload.sandbox,
+            ),
         )
         await conn.execute(
             "insert into phases(job_id,seq,kind,name,owner,acceptance,status,created_at)"
@@ -109,7 +145,13 @@ async def create_job(payload: JobCreate) -> dict[str, Any]:
     await events.record(job_id, "status", {"status": "queued"}, source="system")
     engine.start(job_id)
     log.info("job created", extra={"job_id": job_id, "mode": payload.mode, "team_id": team_id})
-    return {"id": job_id, "status": "queued", "mode": payload.mode, "team_id": team_id}
+    return {
+        "id": job_id,
+        "status": "queued",
+        "mode": payload.mode,
+        "team_id": team_id,
+        "sandbox": payload.sandbox,
+    }
 
 
 @router.get("")
@@ -145,7 +187,7 @@ async def get_job(job_id: JobId) -> dict[str, Any]:
     """
     job = _job_dict(await require_job(job_id))
 
-    phases, agents, artifacts, messages, gates, history = await asyncio.gather(
+    phases, agents, artifacts, messages, gates, calls, history = await asyncio.gather(
         db.fetch_all("select * from phases where job_id=? order by seq", (job_id,)),
         db.fetch_all("select * from job_agents where job_id=? order by agent", (job_id,)),
         db.fetch_all(
@@ -153,6 +195,10 @@ async def get_job(job_id: JobId) -> dict[str, Any]:
         ),
         db.fetch_all("select * from job_messages where job_id=? order by id", (job_id,)),
         db.fetch_all("select * from approvals where job_id=? order by created_at", (job_id,)),
+        db.fetch_all(
+            f"select {TOOL_CALL_COLUMNS} from tool_calls where job_id=? order by created_at,rowid",
+            (job_id,),
+        ),
         events.history(job_id, after=0, limit=2000),
     )
 
@@ -163,6 +209,7 @@ async def get_job(job_id: JobId) -> dict[str, Any]:
         "artifacts": [dict(row) for row in artifacts],
         "messages": [dict(row) for row in messages],
         "approvals": [dict(row) for row in gates],
+        "tool_calls": [_tool_call_dict(row) for row in calls],
         "events": [event.to_dict() for event in history],
         "cursor": history[-1].id if history else 0,
     }
@@ -212,6 +259,54 @@ async def download_artifact(job_id: JobId, artifact_id: Annotated[int, Path(ge=1
         media_type=row["mime_type"] or "text/plain",
         headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )
+
+
+@router.get("/{job_id}/tool-calls")
+async def get_tool_calls(
+    job_id: JobId,
+    phase_id: Annotated[int | None, Query(ge=1)] = None,
+    limit: Annotated[int, Query(ge=1, le=2000)] = 500,
+) -> list[dict[str, Any]]:
+    """Every command the team has run on this job, oldest first.
+
+    Metadata only — ``stdout``/``stderr`` come from the single-call endpoint, so
+    opening the Commands tab on a job that ran a test suite does not download the
+    whole suite's output.
+    """
+    await require_job(job_id)
+    where = "job_id=?"
+    params: list[Any] = [job_id]
+    if phase_id is not None:
+        where += " and phase_id=?"
+        params.append(phase_id)
+    params.append(limit)
+    rows = await db.fetch_all(
+        f"select {TOOL_CALL_COLUMNS} from tool_calls where {where}"
+        " order by created_at,rowid limit ?",
+        tuple(params),
+    )
+    return [_tool_call_dict(row) for row in rows]
+
+
+@router.get("/{job_id}/tool-calls/{call_id}")
+async def get_tool_call(
+    job_id: JobId,
+    call_id: Annotated[str, Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")],
+) -> dict[str, Any]:
+    """One command, including the captured output slice.
+
+    The slice is what the database kept; the untruncated streams live in the
+    workspace, which ``stdout_path``/``stderr_path`` name so the operator can go and
+    read what was cut.
+    """
+    await require_job(job_id)
+    row = await db.fetch_one("select * from tool_calls where id=? and job_id=?", (call_id, job_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="tool call not found")
+    call = _tool_call_dict(row)
+    call["stdout_path"] = f".agent-hub/tool-{call_id}.out"
+    call["stderr_path"] = f".agent-hub/tool-{call_id}.err"
+    return call
 
 
 @router.get("/{job_id}/messages")
@@ -311,6 +406,17 @@ async def stop_job(job_id: JobId) -> JobAction:
     await db.execute(
         "update approvals set status='rejected',decided_at=unixepoch('subsec'),"
         "decision_note='job stopped' where job_id=? and status='pending'",
+        (job_id,),
+    )
+    # A command that was in flight died with the task that spawned it, so the row must
+    # say so. Left as 'running' the Commands view would claim a stopped job is still
+    # executing something, and the startup sweep deliberately skips terminal jobs, so
+    # nothing else would ever correct it.
+    await db.execute(
+        "update tool_calls"
+        " set status=case status when 'running' then 'interrupted' else 'cancelled' end,"
+        "finished_at=unixepoch('subsec')"
+        " where job_id=? and status in ('running','pending')",
         (job_id,),
     )
     await db.execute(

@@ -19,6 +19,7 @@ import json
 import os
 import tempfile
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,12 @@ os.environ["AGENT_HUB_CODEX_CONFIG"] = str(_TMP / "no-such-config.toml")
 os.environ["AGENT_HUB_LOG_FORMAT"] = "text"
 os.environ["AGENT_HUB_LOG_LEVEL"] = "WARNING"
 os.environ["AGENT_HUB_SHUTDOWN_GRACE"] = "2"
+# Tools stay enabled so every test runs the real agent loop, but confinement is
+# pinned to unconfined: whether bubblewrap works is a property of the host, not of
+# the code under test, and `build_sandbox` refuses rather than degrading — so an
+# unpinned default would turn a missing kernel feature into 65 failures. Commands
+# in tests are harmless (`echo`, `cat`, `sleep`) and run in a temp workspace.
+os.environ["AGENT_HUB_SANDBOX"] = "unconfined"
 
 import httpx  # noqa: E402
 import pytest  # noqa: E402
@@ -43,7 +50,12 @@ from app.main import app  # noqa: E402
 from app.orchestrator import approvals as approvals_mod  # noqa: E402
 from app.orchestrator import engine as engine_mod  # noqa: E402
 from app.orchestrator.engine import TERMINAL_JOB_STATUSES  # noqa: E402
-from app.orchestrator.providers import Completion, Message, ProviderError  # noqa: E402
+from app.orchestrator.providers import (  # noqa: E402
+    Completion,
+    Message,
+    ProviderError,
+    ToolCallRequest,
+)
 
 PLAN_MARKER = "Reply with JSON only"
 
@@ -72,6 +84,40 @@ DEFAULT_PLAN = {
 }
 
 
+@dataclass
+class ScriptedTurn:
+    """One turn of a tool conversation, as the fake provider will replay it.
+
+    ``envelope`` renders the call as the text-shaped fallback documented in the
+    system preamble instead of native ``tool_calls``, which is how the loop's
+    fallback path is exercised without a provider that lacks function calling.
+    """
+
+    calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    text: str = ""
+    envelope: bool = False
+
+
+def tool(name: str, **args: Any) -> ScriptedTurn:
+    """A turn that calls one tool natively."""
+    return ScriptedTurn(calls=[(name, args)])
+
+
+def tools_turn(*calls: tuple[str, dict[str, Any]], text: str = "") -> ScriptedTurn:
+    """A turn that calls several tools at once, in order."""
+    return ScriptedTurn(calls=list(calls), text=text)
+
+
+def envelope(name: str, **args: Any) -> ScriptedTurn:
+    """A turn that asks for a tool through the JSON text envelope."""
+    return ScriptedTurn(calls=[(name, args)], envelope=True)
+
+
+def says(text: str) -> ScriptedTurn:
+    """A turn with no tool call — which ends the loop and becomes the phase output."""
+    return ScriptedTurn(text=text)
+
+
 class FakeProvider:
     """A scripted provider.
 
@@ -81,6 +127,11 @@ class FakeProvider:
     wait for that instead of assuming the call has started. ``fail_after`` breaks a
     chosen call, which is how the failure paths are reached: the engine opens one
     provider per job, so a test cannot swap in a broken one mid-run.
+
+    ``tool_script`` is consumed only by calls that were offered tools, which is
+    exactly the tool loop — planning, synthesis and the loop's own closing summary
+    all pass ``tools=None`` and fall through to the default text response. So a
+    script describes the work phases and nothing else.
     """
 
     def __init__(self, plan: dict[str, Any] | None = None) -> None:
@@ -96,6 +147,11 @@ class FakeProvider:
         self.cancelled = 0
         self.fail_after: int | None = None
         self.fail_with = "upstream returned 502"
+        self.tool_script: list[ScriptedTurn] = []
+        #: Every ``tools`` argument received, so a test can assert the schemas were
+        #: actually offered rather than inferring it from behaviour.
+        self.tools_seen: list[list[dict[str, Any]] | None] = []
+        self.tool_calls_made = 0
 
     async def __aenter__(self) -> FakeProvider:
         self.entered += 1
@@ -118,10 +174,12 @@ class FakeProvider:
         messages: list[Message],
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> Completion:
         prompt = messages[-1].content
         self.prompts.append(prompt)
         self.systems.append(system)
+        self.tools_seen.append(tools)
 
         if self.gate is not None and len(self.prompts) > self.gate_after:
             self.blocked.set()
@@ -136,8 +194,36 @@ class FakeProvider:
 
         if PLAN_MARKER in prompt:
             return Completion(text=json.dumps(self.plan), model=self.model)
+
+        if tools and self.tool_script:
+            return self._scripted(self.tool_script.pop(0))
+
         first_line = prompt.splitlines()[0] if prompt else ""
         return Completion(text=f"[{len(self.prompts)}] output for {first_line}", model=self.model)
+
+    def _scripted(self, turn: ScriptedTurn) -> Completion:
+        if not turn.calls:
+            return Completion(text=turn.text or "nothing further", model=self.model)
+
+        self.tool_calls_made += len(turn.calls)
+        if turn.envelope:
+            name, args = turn.calls[0]
+            return Completion(
+                text=json.dumps({"tool": name, "args": args}), model=self.model
+            )
+        return Completion(
+            text=turn.text,
+            model=self.model,
+            tool_calls=[
+                ToolCallRequest(
+                    id=f"call_{self.tool_calls_made}_{index}",
+                    name=name,
+                    arguments=json.dumps(args),
+                )
+                for index, (name, args) in enumerate(turn.calls)
+            ],
+            finish_reason="tool_calls",
+        )
 
     async def wait_until_blocked(self, timeout: float = 5.0) -> None:
         await asyncio.wait_for(self.blocked.wait(), timeout)

@@ -21,8 +21,10 @@ from sqlite3 import IntegrityError
 from app.deps import db
 from app.logging_setup import get_logger
 from app.models import ProviderUpsert, TemplateCreate
+from app.config import settings
 from app.orchestrator.providers import ProviderConfigError, resolve_secret
 from app.orchestrator.roles import TeamError, load_team
+from app.orchestrator.sandbox import default_kind, status as sandbox_status
 
 log = get_logger("agent_hub.api.config")
 
@@ -115,6 +117,50 @@ async def delete_provider(provider_id: ProviderId) -> dict[str, Any]:
         await db.execute("update provider_profiles set enabled=0 where id=?", (provider_id,))
         return {"id": provider_id, "deleted": False, "disabled": True, "jobs": int(in_use)}
     return {"id": provider_id, "deleted": True, "disabled": False, "jobs": 0}
+
+
+# ------------------------------------------------------------------------ sandbox
+
+
+@router.get("/sandbox")
+async def get_sandbox() -> dict[str, Any]:
+    """Which confinement backends work on this host, and which one jobs get.
+
+    The New Job picker is built from this rather than from a hardcoded list, because
+    ``sandboxed`` depends on whether the kernel allows unprivileged user namespaces —
+    a fact only the startup probe knows. Offering a backend that fails on every
+    command would be worse than not offering it, and silently substituting a weaker
+    one would be worse still.
+
+    ``default`` is set by ``AGENT_HUB_SANDBOX`` on the service, not through the API:
+    it is an operator decision about the host, and a job that wants the other one
+    says so at creation.
+    """
+    probed = sandbox_status()
+    backends = [
+        {
+            "id": state.id,
+            "label": state.label,
+            "available": state.available,
+            "reason": state.reason,
+        }
+        for state in probed.values()
+    ]
+    default = default_kind()
+    default_state = probed.get(default)
+    return {
+        "default": default,
+        "default_available": default_state.available if default_state else None,
+        "tools_enabled": settings.tools_enabled,
+        "network": settings.tool_network,
+        "backends": backends,
+        "limits": {
+            "max_turns": settings.tool_max_turns,
+            "command_timeout": settings.tool_timeout,
+            "wall_clock": settings.tool_wall_clock,
+            "output_limit": settings.tool_output_limit,
+        },
+    }
 
 
 # --------------------------------------------------------------------------- teams

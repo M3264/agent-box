@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ApiError, api } from '../api'
-import type { Mode, Provider, Team } from '../types'
+import type { Mode, Provider, SandboxInfo, SandboxKind, Team } from '../types'
 import { ErrorNote } from './ui'
 
 export function NewJob({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -13,19 +13,22 @@ export function NewJob({ open, onClose }: { open: boolean; onClose: () => void }
   const [mode, setMode] = useState<Mode>('controlled')
   const [teamId, setTeamId] = useState<number | ''>('')
   const [providerId, setProviderId] = useState('')
+  const [sandbox, setSandbox] = useState<SandboxKind | ''>('')
   const [teams, setTeams] = useState<Team[]>([])
   const [providers, setProviders] = useState<Provider[]>([])
+  const [sandboxes, setSandboxes] = useState<SandboxInfo | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!open) return
     let alive = true
-    void Promise.all([api.teams(), api.providers()])
-      .then(([loadedTeams, loadedProviders]) => {
+    void Promise.all([api.teams(), api.providers(), api.sandbox()])
+      .then(([loadedTeams, loadedProviders, loadedSandbox]) => {
         if (!alive) return
         setTeams(loadedTeams)
         setProviders(loadedProviders.filter((profile) => profile.enabled))
+        setSandboxes(loadedSandbox)
       })
       .catch(() => undefined)
     return () => {
@@ -36,6 +39,7 @@ export function NewJob({ open, onClose }: { open: boolean; onClose: () => void }
   useEffect(() => {
     if (open) return
     setTask('')
+    setSandbox('')
     setError(null)
     setBusy(false)
   }, [open])
@@ -53,6 +57,7 @@ export function NewJob({ open, onClose }: { open: boolean; onClose: () => void }
         mode,
         ...(teamId === '' ? {} : { team_id: teamId }),
         ...(providerId ? { provider_id: providerId } : {}),
+        ...(sandbox ? { sandbox } : {}),
       })
       onClose()
       void navigate(`/jobs/${created.id}`)
@@ -61,6 +66,9 @@ export function NewJob({ open, onClose }: { open: boolean; onClose: () => void }
       setBusy(false)
     }
   }
+
+  const chosen = sandbox || sandboxes?.default
+  const chosenState = sandboxes?.backends.find((backend) => backend.id === chosen)
 
   return (
     <div className="modal-root">
@@ -122,6 +130,39 @@ export function NewJob({ open, onClose }: { open: boolean; onClose: () => void }
               ))}
             </select>
           </label>
+
+          {sandboxes?.tools_enabled ? (
+            <label className="field">
+              <span>Confinement</span>
+              <select
+                value={sandbox}
+                onChange={(event) => setSandbox(event.target.value as SandboxKind | '')}
+              >
+                <option value="">Server default ({sandboxes.default})</option>
+                {sandboxes.backends.map((backend) => (
+                  <option
+                    key={backend.id}
+                    value={backend.id}
+                    disabled={!backend.available}
+                    title={backend.available ? backend.reason : `Unavailable: ${backend.reason}`}
+                  >
+                    {backend.label}
+                    {!backend.available ? ' (unavailable)' : ''}
+                    {backend.id === 'unconfined'
+                      ? ' — runs as the service user, no credential masking'
+                      : ''}
+                  </option>
+                ))}
+              </select>
+              {chosenState && !chosenState.available ? (
+                <span className="field-note error">{chosenState.reason}</span>
+              ) : chosenState?.id === 'unconfined' ? (
+                <span className="field-note warn">
+                  Unconfined: the service user's files, credentials, and sudo access are reachable.
+                </span>
+              ) : null}
+            </label>
+          ) : null}
         </div>
 
         {error ? <ErrorNote>{error}</ErrorNote> : null}

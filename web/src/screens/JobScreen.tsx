@@ -1,5 +1,5 @@
 /**
- * Job detail: header, controls, and the six routed tabs from PLAN.md §4.
+ * Job detail: header, controls, and the routed tabs from PLAN.md §4.
  *
  * One `useJobStream` for the whole screen, so switching tabs neither refetches nor
  * drops the stream. Tab state lives in the URL, which makes a particular view of a
@@ -16,6 +16,7 @@ import { fullTime, since } from '../lib/format'
 import { AgentsView } from './job/AgentsView'
 import { ApprovalsView } from './job/ApprovalsView'
 import { ArtifactsView } from './job/ArtifactsView'
+import { CommandsView } from './job/CommandsView'
 import { Conversation } from './job/Conversation'
 import { PlanView } from './job/PlanView'
 import { Timeline } from './job/Timeline'
@@ -58,6 +59,7 @@ export function JobScreen() {
   const live = isLive(job.status)
   const pending = job.approvals.filter((approval) => approval.status === 'pending').length
   const complete = job.plan.filter((phase) => phase.status === 'complete').length
+  const tools = job.tool_calls.length
   const tab = (path: string, text: string, count?: number) => (
     <NavLink to={`/jobs/${jobId}${path}`} end={path === ''} className="tab">
       {text}
@@ -139,6 +141,7 @@ export function JobScreen() {
         {tab('/timeline', 'Timeline', events.length)}
         {tab('/plan', 'Plan', job.plan.length)}
         {tab('/agents', 'Agents', job.team.length)}
+        {tab('/commands', 'Commands', tools || undefined)}
         {tab('/artifacts', 'Artifacts', job.artifacts.length)}
         {tab('/approvals', 'Approvals', pending)}
       </nav>
@@ -162,6 +165,17 @@ export function JobScreen() {
           <Route
             path="agents"
             element={<AgentsView team={job.team} plan={job.plan} events={events} />}
+          />
+          <Route
+            path="commands"
+            element={
+              <CommandsView
+                jobId={jobId}
+                toolCalls={job.tool_calls}
+                plan={job.plan}
+                sandbox={job.sandbox}
+              />
+            }
           />
           <Route
             path="artifacts"

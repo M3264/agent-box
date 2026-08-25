@@ -84,22 +84,39 @@ async def request(
     detail: str | None = None,
     risk: str = "high",
     auto_approve: bool = False,
+    kind: str = "phase",
+    tool_call_id: str | None = None,
 ) -> str:
     """Create a gate. In yolo mode it is recorded already-approved, not skipped.
 
     Recording the auto-approval keeps the audit trail honest about what ran
     without review, which is the point of having modes at all.
+
+    ``kind`` separates a gate on a whole phase from a gate on a single command. Both
+    carry the same ``phase_id``, and ``latest_for_phase`` must not mistake one for the
+    other — a declined command would otherwise look like a declined phase after a
+    restart.
+
+    ``tool_call_id`` links the gate to the command row in the *same* commit. Stamped
+    afterwards it is a separate write, and between the two the gate is already visible
+    while the row it belongs to still reads ``approval_id = null`` — a window a poller
+    can land in, and one that made a test flake before it made anything worse.
     """
     approval_id = uuid.uuid4().hex[:10]
     status = "approved" if auto_approve else "pending"
 
-    await database.execute(
-        "insert into approvals(id,job_id,phase_id,agent,action,detail,risk,status,auto,created_at,decided_at)"
-        " values(?,?,?,?,?,?,?,?,?,unixepoch('subsec'),"
-        + ("unixepoch('subsec')" if auto_approve else "null")
-        + ")",
-        (approval_id, job_id, phase_id, agent, action, detail, risk, status, int(auto_approve)),
-    )
+    async with database.transaction() as conn:
+        await conn.execute(
+            "insert into approvals(id,job_id,phase_id,agent,action,detail,risk,status,auto,kind,created_at,decided_at)"
+            " values(?,?,?,?,?,?,?,?,?,?,unixepoch('subsec'),"
+            + ("unixepoch('subsec')" if auto_approve else "null")
+            + ")",
+            (approval_id, job_id, phase_id, agent, action, detail, risk, status, int(auto_approve), kind),
+        )
+        if tool_call_id is not None:
+            await conn.execute(
+                "update tool_calls set approval_id=? where id=?", (approval_id, tool_call_id)
+            )
     await store.record(
         job_id,
         "approval",
@@ -111,12 +128,19 @@ async def request(
             "status": status,
             "auto": auto_approve,
             "phase_id": phase_id,
+            "kind": kind,
         },
         source=agent,
     )
     log.info(
         "approval recorded",
-        extra={"job_id": job_id, "approval_id": approval_id, "status": status, "auto": auto_approve},
+        extra={
+            "job_id": job_id,
+            "approval_id": approval_id,
+            "status": status,
+            "auto": auto_approve,
+            "kind": kind,
+        },
     )
     return approval_id
 
@@ -202,22 +226,26 @@ async def wait_for(
 
 
 async def pending_for_phase(database: Database, phase_id: int) -> str | None:
-    """The open gate blocking a phase, if any. Used to re-attach after a restart."""
+    """The open phase gate blocking a phase, if any. Used to re-attach after a restart."""
     return await database.fetch_value(
-        "select id from approvals where phase_id=? and status='pending' order by created_at limit 1",
+        "select id from approvals where phase_id=? and status='pending' and kind='phase'"
+        " order by created_at limit 1",
         (phase_id,),
     )
 
 
 async def latest_for_phase(database: Database, phase_id: int) -> dict[str, Any] | None:
-    """The most recent gate for a phase, whatever its status.
+    """The most recent *phase* gate for a phase, whatever its status.
 
     A restart must distinguish "already approved while we were down" from "never
     gated". Looking only for *pending* approvals would create a second gate and
-    ask the operator to approve the same work twice.
+    ask the operator to approve the same work twice. Restricted to ``kind='phase'``
+    because a phase also accumulates a gate per risky command, and the last of those
+    says nothing about whether the phase itself was approved.
     """
     row = await database.fetch_one(
-        "select * from approvals where phase_id=? order by created_at desc, rowid desc limit 1",
+        "select * from approvals where phase_id=? and kind='phase'"
+        " order by created_at desc, rowid desc limit 1",
         (phase_id,),
     )
     return dict(row) if row else None

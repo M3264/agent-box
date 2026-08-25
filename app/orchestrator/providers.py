@@ -50,9 +50,61 @@ RETRY_BACKOFF = (2.0, 6.0)
 
 
 @dataclass(slots=True)
+class ToolCallRequest:
+    """One tool the model wants run.
+
+    ``arguments`` is kept as the raw string the provider sent, because that is what
+    has to be echoed back verbatim in the assistant message for the conversation to
+    stay well-formed. ``args()`` is the parsed view, and it is deliberately
+    forgiving: a model that emits slightly-off JSON should produce a tool error the
+    model can read and correct, not an exception that kills the phase.
+    """
+
+    id: str
+    name: str
+    arguments: str = "{}"
+
+    def args(self) -> dict[str, Any]:
+        if not self.arguments.strip():
+            return {}
+        try:
+            parsed = parse_json_response(self.arguments)
+        except ProviderError:
+            return {"__unparsed__": self.arguments}
+        return parsed if isinstance(parsed, dict) else {"__unparsed__": self.arguments}
+
+    def wire(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.arguments},
+        }
+
+
+@dataclass(slots=True)
 class Message:
-    role: str  # system | user | assistant
+    role: str  # system | user | assistant | tool
     content: str
+    #: Set on an assistant message that asked for tools. Echoed back unchanged.
+    tool_calls: list[ToolCallRequest] = field(default_factory=list)
+    #: Set on a ``role="tool"`` message, tying the result to the request.
+    tool_call_id: str | None = None
+    #: The tool's name. Not required by the spec, but some endpoints reject a tool
+    #: message without it.
+    name: str | None = None
+
+    def wire(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"role": self.role, "content": self.content}
+        if self.tool_calls:
+            payload["tool_calls"] = [call.wire() for call in self.tool_calls]
+            # An assistant turn that only calls tools has no prose. Sending "" is
+            # accepted more widely than null, so only the empty string is used.
+            payload["content"] = self.content or ""
+        if self.tool_call_id:
+            payload["tool_call_id"] = self.tool_call_id
+        if self.name:
+            payload["name"] = self.name
+        return payload
 
 
 @dataclass(slots=True)
@@ -60,10 +112,16 @@ class Completion:
     text: str
     model: str
     usage: dict[str, Any] = field(default_factory=dict)
+    tool_calls: list[ToolCallRequest] = field(default_factory=list)
+    finish_reason: str | None = None
 
     def json(self) -> Any:
         """Parse the completion as JSON, tolerating fenced or prose-wrapped output."""
         return parse_json_response(self.text)
+
+    def as_message(self) -> Message:
+        """This completion as the assistant message to append to the conversation."""
+        return Message(role="assistant", content=self.text, tool_calls=list(self.tool_calls))
 
 
 class Provider(Protocol):
@@ -77,6 +135,7 @@ class Provider(Protocol):
         messages: list[Message],
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> Completion: ...
 
 
@@ -160,6 +219,7 @@ class OpenAICompatibleProvider:
         secret: str | None,
         headers: dict[str, str] | None = None,
         client: httpx.AsyncClient | None = None,
+        supports_tools: bool = True,
     ) -> None:
         self.id = id
         self.base_url = base_url.rstrip("/")
@@ -168,6 +228,7 @@ class OpenAICompatibleProvider:
         self._headers = headers or {}
         self._client = client
         self._owns_client = client is None
+        self.supports_tools = supports_tools
 
     async def __aenter__(self) -> OpenAICompatibleProvider:
         if self._client is None:
@@ -188,12 +249,17 @@ class OpenAICompatibleProvider:
         messages: list[Message],
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> Completion:
         """Call the endpoint, retrying transient failures.
 
         Without this, one hiccup from a proxied endpoint ends a whole job: a live
         run lost a five-phase job to a single HTML error page served by the
-        provider's CDN. LLM calls have no side effects, so replaying one is safe.
+        provider's CDN.
+
+        Retrying is safe *here* and only here. The provider call itself has no side
+        effects, so replaying it costs tokens and nothing else — but the tool loop
+        wrapped around it does have side effects, so it is never retried as a unit.
         """
         if self._client is None:
             raise ProviderConfigError("provider used outside its async context")
@@ -205,11 +271,17 @@ class OpenAICompatibleProvider:
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}]
-            + [{"role": message.role, "content": message.content} for message in messages],
+            + [message.wire() for message in messages],
             "temperature": temperature,
         }
         if max_tokens:
             body["max_tokens"] = max_tokens
+        # Omitted entirely for profiles flagged as not supporting function calling:
+        # some proxies 400 on an unknown parameter rather than ignoring it, which
+        # would take out text-only jobs too.
+        if tools and self.supports_tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
 
         failure: ProviderError | None = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -250,14 +322,56 @@ class OpenAICompatibleProvider:
     def _parse(self, response: httpx.Response) -> Completion:
         try:
             data = response.json()
-            text = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            message = choice["message"]
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
             raise ProviderError(f"unexpected provider response shape: {exc}") from exc
 
-        if text is None:
+        text = message.get("content")
+        calls = _parse_tool_calls(message.get("tool_calls"))
+
+        # An assistant turn that only calls tools has null content, which is
+        # correct rather than empty — so "empty" is only an error when there is no
+        # tool call either.
+        if text is None and not calls:
             raise ProviderError("provider returned an empty message")
 
-        return Completion(text=text, model=data.get("model", self.model), usage=data.get("usage") or {})
+        return Completion(
+            text=text or "",
+            model=data.get("model", self.model),
+            usage=data.get("usage") or {},
+            tool_calls=calls,
+            finish_reason=choice.get("finish_reason"),
+        )
+
+
+def _parse_tool_calls(raw: Any) -> list[ToolCallRequest]:
+    """Read the ``tool_calls`` array, skipping anything malformed.
+
+    Tolerant on purpose: this endpoint is a proxy in front of several upstreams, and
+    one unrecognised entry should cost that call, not the job.
+    """
+    if not isinstance(raw, list):
+        return []
+    calls: list[ToolCallRequest] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            continue
+        function = entry.get("function") or {}
+        name = function.get("name") or entry.get("name")
+        if not name:
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, dict):  # some proxies pre-parse it
+            arguments = json.dumps(arguments)
+        calls.append(
+            ToolCallRequest(
+                id=str(entry.get("id") or f"call_{index}"),
+                name=str(name),
+                arguments=str(arguments or "{}"),
+            )
+        )
+    return calls
 
 
 async def load_profile(database: Database, provider_id: str | None = None) -> dict[str, Any]:
@@ -296,6 +410,8 @@ def build_provider(profile: dict[str, Any], client: httpx.AsyncClient | None = N
         secret=resolve_secret(profile.get("secret_ref"), profile["id"]),
         headers=profile.get("headers") or {},
         client=client,
+        # Defaults on for profiles predating the column.
+        supports_tools=bool(profile.get("supports_tools", 1)),
     )
 
 
@@ -351,10 +467,13 @@ async def complete_with_timeout(
     messages: list[Message],
     temperature: float = 0.2,
     timeout: float | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> Completion:
     limit = timeout or (settings.provider_timeout + 30)
     try:
         async with asyncio.timeout(limit):
-            return await provider.complete(system=system, messages=messages, temperature=temperature)
+            return await provider.complete(
+                system=system, messages=messages, temperature=temperature, tools=tools
+            )
     except TimeoutError as exc:
         raise ProviderError(f"provider call exceeded {limit:.0f}s") from exc

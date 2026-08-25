@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from app.db import db
-from app.migrations import migrate
+from app.migrations import discover, migrate
 from app.orchestrator import engine as engine_mod
 from app.orchestrator.providers import ProviderError
 from tests.conftest import FakeProvider, phase_rows, wait_for_job
@@ -17,7 +17,10 @@ async def test_health_reports_schema_and_state(client: httpx.AsyncClient) -> Non
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
-    assert body["schema_version"] == 1
+    # Every shipped migration should be applied by the time health says "ok", so this
+    # tracks the migration set rather than a literal — a mismatch means the service is
+    # reporting a schema it does not actually have.
+    assert body["schema_version"] == max(version for version, _ in discover())
     assert body["active_jobs"] == 0
 
 
@@ -133,7 +136,10 @@ async def test_unknown_job_is_404(client: httpx.AsyncClient) -> None:
 async def test_unknown_team_falls_back_to_default(job) -> None:
     """v1 accepted any ``team_id`` and ignored it; the default was 3 with only 1 existing."""
     job_id = await job(team_id=999)
-    assert await db.fetch_value("select team_id from jobs where id=?", (job_id,)) == 1
+    # The default template moves as new versions are seeded (migration 002 appends a
+    # tool-aware v2), so the claim is "it lands on whichever row is default", not "1".
+    default_id = await db.fetch_value("select id from team_templates where is_default=1")
+    assert await db.fetch_value("select team_id from jobs where id=?", (job_id,)) == default_id
 
 
 async def test_unknown_provider_is_rejected(client: httpx.AsyncClient) -> None:

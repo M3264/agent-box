@@ -139,11 +139,22 @@ async def test_delete_keeps_a_profile_that_history_depends_on(
 
 async def test_seeded_team_is_the_four_role_default(client: httpx.AsyncClient) -> None:
     teams = (await client.get("/api/teams")).json()
-    assert len(teams) == 1
-    default = teams[0]
-    assert default["is_default"] is True
+    # Two seeded rows now: the original, and the v2 rewrite whose specialists are told
+    # they have a shell. Templates are append-only, so migration 002 adds a row and
+    # moves `is_default` rather than editing the instructions a finished job ran with.
+    assert len(teams) == 2
+    defaults = [team for team in teams if team["is_default"]]
+    assert len(defaults) == 1, "exactly one template may be the default"
+    default = defaults[0]
+    assert default["id"] == max(team["id"] for team in teams), "the newest seed leads"
     assert [role["id"] for role in default["roles"]] == ["manager", "architect", "coder", "tester"]
     assert [role["id"] for role in default["roles"] if role["orchestrator"]] == ["manager"]
+
+    # The point of v2 is that the roles know they can act. A template that still reads
+    # like v1 would run the tools code and never use it.
+    instructions = {role["id"]: role["instructions"] for role in default["roles"]}
+    assert "write_file" in instructions["coder"]
+    assert "Verify the work by executing it" in instructions["tester"]
 
     assert (await client.get(f"/api/teams/{default['id']}")).json() == default
     assert (await client.get("/api/teams/999")).status_code == 404
@@ -182,6 +193,9 @@ async def test_team_must_have_exactly_one_orchestrator(client: httpx.AsyncClient
             {**CUSTOM_TEAM["roles"][1], "orchestrator": True},
         ],
     }
+    # Snapshot rather than a literal: the claim is that nothing was *added*, which is
+    # independent of how many templates the migrations happen to seed.
+    seeded = await db.fetch_value("select count(*) from team_templates")
     assert (await client.post("/api/teams", json=two_leads)).status_code == 422
 
     no_lead = {"name": "Leaderless", "roles": [{**CUSTOM_TEAM["roles"][1]}]}
@@ -190,7 +204,7 @@ async def test_team_must_have_exactly_one_orchestrator(client: httpx.AsyncClient
     duplicates = {"name": "Dupes", "roles": [CUSTOM_TEAM["roles"][0], CUSTOM_TEAM["roles"][0]]}
     assert (await client.post("/api/teams", json=duplicates)).status_code == 422
 
-    assert await db.fetch_value("select count(*) from team_templates") == 1, (
+    assert await db.fetch_value("select count(*) from team_templates") == seeded, (
         "a rejected template must not be left behind"
     )
 
@@ -202,7 +216,9 @@ async def test_default_team_is_used_when_a_job_omits_one(client: httpx.AsyncClie
     assert promoted.json()["is_default"] is True
 
     teams = {item["id"]: item for item in (await client.get("/api/teams")).json()}
-    assert teams[1]["is_default"] is False, "only one template may be the default"
+    assert [item["id"] for item in teams.values() if item["is_default"]] == [team_id], (
+        "only one template may be the default"
+    )
 
     job_id = await job()
     assert await db.fetch_value("select team_id from jobs where id=?", (job_id,)) == team_id

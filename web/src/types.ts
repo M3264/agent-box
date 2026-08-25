@@ -19,7 +19,73 @@ export type PhaseStatus =
 
 export type Mode = 'controlled' | 'yolo'
 
+export type SandboxKind = 'sandboxed' | 'unconfined'
+
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected'
+
+/**
+ * How a command ended.
+ *
+ * `running` is not a transient UI state — it is what the database holds while the
+ * process exists, and what a crash leaves behind until recovery turns it into
+ * `interrupted`.
+ */
+export type ToolCallStatus =
+  | 'pending'
+  | 'running'
+  | 'ok'
+  | 'error'
+  | 'denied'
+  | 'refused'
+  | 'timeout'
+  | 'interrupted'
+  | 'capped'
+  | 'cancelled'
+
+export interface ToolCall {
+  id: string
+  job_id: string
+  phase_id: number | null
+  turn: number
+  agent: string
+  tool: 'run' | 'read_file' | 'write_file' | 'fetch' | string
+  args: Record<string, unknown>
+  status: ToolCallStatus
+  exit_code: number | null
+  truncated: boolean
+  sandbox: SandboxKind | null
+  approval_id: string | null
+  duration_ms: number | null
+  created_at: number
+  started_at: number | null
+  finished_at: number | null
+  /** Only on the single-call endpoint: the list omits output on purpose. */
+  stdout?: string | null
+  stderr?: string | null
+  stdout_path?: string
+  stderr_path?: string
+}
+
+export interface SandboxBackend {
+  id: SandboxKind
+  label: string
+  available: boolean
+  reason: string
+}
+
+export interface SandboxInfo {
+  default: SandboxKind
+  default_available: boolean | null
+  tools_enabled: boolean
+  network: boolean
+  backends: SandboxBackend[]
+  limits: {
+    max_turns: number
+    command_timeout: number
+    wall_clock: number
+    output_limit: number
+  }
+}
 
 export interface JobSummary {
   id: string
@@ -29,6 +95,8 @@ export interface JobSummary {
   mode: Mode
   team_id: number
   provider_id: string | null
+  /** Which confinement the job ran under; null until the engine resolves it. */
+  sandbox: SandboxKind | null
   created_at: number
   updated_at: number
   error: string | null
@@ -121,12 +189,15 @@ export interface JobEvent {
 
 export interface JobSnapshot extends Omit<JobSummary, 'pending_approvals' | 'phase_total' | 'phase_complete' | 'artifact_count'> {
   workspace: string | null
+  /** Which confinement this job actually ran under; null when tools are off. */
+  sandbox: SandboxKind | null
   result: { content: string } | null
   team: Agent[]
   plan: Phase[]
   artifacts: Artifact[]
   messages: JobMessage[]
   approvals: Approval[]
+  tool_calls: ToolCall[]
   events: JobEvent[]
   cursor: number
 }
@@ -178,6 +249,9 @@ export interface Health {
     jobs?: number
     pending_approvals?: number
     db_path?: string
+    tools_enabled?: boolean
+    sandbox_default?: SandboxKind
+    sandboxes?: Record<string, { available: boolean; reason: string }>
     error?: string
   }
 }

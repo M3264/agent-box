@@ -33,7 +33,8 @@ from app.config import settings
 from app.db import Database
 from app.events import EventStore
 from app.logging_setup import get_logger
-from app.orchestrator import approvals
+from app.models import TERMINAL_JOB_STATUSES
+from app.orchestrator import agentloop, approvals, sandbox as sandbox_mod
 from app.orchestrator.providers import (
     Completion,
     Message,
@@ -48,8 +49,6 @@ log = get_logger("agent_hub.engine")
 
 #: A phase in one of these states will never run again.
 TERMINAL_PHASE_STATUSES = frozenset({"complete", "failed", "skipped"})
-#: A job in one of these states has no in-flight work.
-TERMINAL_JOB_STATUSES = frozenset({"complete", "error", "stopped"})
 
 MAX_PLANNED_PHASES = 8
 #: Per-phase output is truncated when composing context so a long job cannot grow
@@ -200,6 +199,11 @@ class JobEngine:
         Safe because phase state is durable: each job continues at its first
         non-terminal phase rather than starting over.
         """
+        # Before anything restarts, resolve the tool calls that were in flight. A
+        # command's side effects are not in the database, so the only honest thing to
+        # do is mark them interrupted and tell the re-running phase about them.
+        await agentloop.sweep_interrupted(self.db)
+
         rows = await self.db.fetch_all(
             "select id from jobs where status not in ('complete','error','stopped') order by created_at"
         )
@@ -213,13 +217,36 @@ class JobEngine:
     # -------------------------------------------------------------- persistence
 
     async def _set_job_status(self, job_id: str, status: str, **columns: Any) -> None:
+        """Write the job's status, never resurrecting a job an operator has stopped.
+
+        A non-terminal write carries a guard, because every one of them sits after a
+        check that has already gone stale. ``_run`` reads the status at the top and
+        writes 'running' several awaits later; the phase gate checks ``cancel`` and then
+        writes 'running'. A ``stop`` landing in either window writes 'stopped' and
+        cancels the task — but the cancellation is only delivered at the *next* await, so
+        the write below can still land on top of it, leaving a job that reads 'running'
+        with nothing running. Terminal writes are unguarded: 'complete', 'error' and
+        'stopped' are allowed to overwrite each other, and the first one wins the phase
+        loop anyway.
+        """
         assignments = ["status=?", "updated_at=unixepoch('subsec')"]
         params: list[Any] = [status]
         for name, value in columns.items():
             assignments.append(f"{name}=?")
             params.append(value)
         params.append(job_id)
-        await self.db.execute(f"update jobs set {','.join(assignments)} where id=?", params)
+        guard = ""
+        if status not in TERMINAL_JOB_STATUSES:
+            placeholders = ",".join("?" * len(TERMINAL_JOB_STATUSES))
+            guard = f" and status not in ({placeholders})"
+            params.extend(sorted(TERMINAL_JOB_STATUSES))
+        changed = await self.db.execute(
+            f"update jobs set {','.join(assignments)} where id=?{guard}", params
+        )
+        # Nothing changed means the guard bit, so there is nothing to announce either:
+        # a 'running' event after 'stopped' would tell every live stream the job is back.
+        if not changed:
+            return
         await self.store.record(job_id, "status", {"status": status}, source="system")
 
     async def _set_agent(
@@ -321,6 +348,11 @@ class JobEngine:
 
             team = await load_team(self.db, int(job["team_id"]))
             profile = await load_profile(self.db, job["provider_id"])
+            # Resolved once, here, and deliberately before the first phase runs. If the
+            # job asked for a backend this host cannot provide, it must fail with that
+            # message rather than run a single command somewhere the operator did not
+            # choose — build_sandbox raises instead of substituting.
+            box = await self._resolve_sandbox(job)
 
             await self._set_job_status(job_id, "running")
             for role in team.roles:
@@ -351,7 +383,7 @@ class JobEngine:
                             },
                             source=previous_owner,
                         )
-                    await self._run_phase(job, team, provider, phase, cancel)
+                    await self._run_phase(job, team, provider, phase, cancel, box)
                     previous_owner = phase.owner
 
             await self._finish(job_id, team)
@@ -382,6 +414,30 @@ class JobEngine:
                 (job_id,),
             )
             await self.store.record(job_id, "status", {"status": "error"}, source="system")
+
+    async def _resolve_sandbox(self, job: Any) -> sandbox_mod._Sandbox | None:
+        """Decide where this job's commands run, and record it.
+
+        Returns None when tools are switched off, which turns every phase back into a
+        single text-only call. The backend is written onto the row the first time it is
+        resolved so the audit trail says what actually ran the commands, not what the
+        default happened to be when someone later opened the Commands view.
+        """
+        if not settings.tools_enabled:
+            return None
+
+        job_id = job["id"]
+        workspace = Path(job["workspace"]) if job["workspace"] else settings.workspace_root / job_id
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        chosen = job["sandbox"] or sandbox_mod.default_kind()
+        box = sandbox_mod.build_sandbox(chosen, workspace)
+        if job["sandbox"] != chosen or job["workspace"] != str(workspace):
+            await self.db.execute(
+                "update jobs set sandbox=?,workspace=? where id=?",
+                (chosen, str(workspace), job_id),
+            )
+        return box
 
     async def _park_for_recovery(self, job_id: str) -> None:
         """Leave an interrupted job resumable.
@@ -442,6 +498,7 @@ class JobEngine:
         provider: Provider,
         phase: PhaseRow,
         cancel: asyncio.Event,
+        box: sandbox_mod._Sandbox | None = None,
     ) -> None:
         job_id = job["id"]
         role = team.get(phase.owner) or team.orchestrator
@@ -469,7 +526,7 @@ class JobEngine:
             elif phase.kind == "synthesis":
                 output = await self._do_synthesis(job, team, provider, phase, guidance)
             else:
-                output = await self._do_work(job, team, provider, phase, role, guidance)
+                output = await self._do_work(job, team, provider, phase, role, guidance, box, cancel)
         except asyncio.CancelledError:
             raise
         except ProviderError as exc:
@@ -531,14 +588,24 @@ class JobEngine:
         # case: the phase has not run, and `latest_for_phase` finds no gate on
         # recovery, so one is raised then.
         async with self.db.transaction() as conn:
+            if not auto:
+                # Guarded, and first, so a stop that has already made the job terminal
+                # ends this phase instead of pulling the job back to 'blocked'. The
+                # rollback takes the phase write with it, and CancelledError is simply
+                # the truth: this phase is not going to run. The `cancel` check above
+                # cannot cover it — `conn.execute` is an await, so a cancellation
+                # requested in between is delivered only after this write lands.
+                placeholders = ",".join("?" * len(TERMINAL_JOB_STATUSES))
+                async with conn.execute(
+                    "update jobs set status='blocked',updated_at=unixepoch('subsec')"
+                    f" where id=? and status not in ({placeholders})",
+                    (job_id, *sorted(TERMINAL_JOB_STATUSES)),
+                ) as cursor:
+                    if cursor.rowcount == 0:
+                        raise asyncio.CancelledError()
             await conn.execute(
                 "update phases set status='blocked_on_approval' where id=?", (phase.id,)
             )
-            if not auto:
-                await conn.execute(
-                    "update jobs set status='blocked',updated_at=unixepoch('subsec') where id=?",
-                    (job_id,),
-                )
         if not reattaching:
             await self._emit_phase(job_id, phase, "blocked_on_approval")
         if not auto:
@@ -746,6 +813,8 @@ class JobEngine:
         phase: PhaseRow,
         role: Role,
         guidance: list[str],
+        box: sandbox_mod._Sandbox | None = None,
+        cancel: asyncio.Event | None = None,
     ) -> str:
         job_id = job["id"]
         context = self._context_block(await self._prior_outputs(job_id, phase.seq))
@@ -755,22 +824,62 @@ class JobEngine:
             if guidance
             else ""
         )
+        # A phase that is re-running after a crash is told what its last attempt had in
+        # flight. This is the seam where "resume, don't replay" stops being enough:
+        # commands changed the filesystem, and the model has to know that before it
+        # repeats one.
+        notice = await agentloop.interrupted_notice(self.db, phase.id)
         prompt = (
             f"Overall task:\n{job['task']}\n\n"
             f"Your phase: {phase.name}\n"
             f"Acceptance criteria: {phase.acceptance or 'use your judgement'}\n\n"
-            f"Work completed so far:\n{context}{guidance_block}\n\n"
+            f"Work completed so far:\n{context}{guidance_block}{notice}\n\n"
             "Do your phase now. Be concrete and specific, and hand off work the next "
             "specialist can build on directly."
         )
-        completion = await self._ask(provider, f"You are {role.name}. {role.instructions}", prompt)
+        system = f"You are {role.name}. {role.instructions}"
+
+        if box is None:
+            completion = await self._ask(provider, system, prompt)
+            text = completion.text
+        else:
+            loop = agentloop.ToolLoop(
+                db=self.db,
+                store=self.store,
+                provider=provider,
+                sandbox=box,
+                workspace=box.workspace,
+                job_id=job_id,
+                phase_id=phase.id,
+                phase_name=phase.name,
+                agent=role.id,
+                cancel=cancel if cancel is not None else asyncio.Event(),
+            )
+            result = await loop.run(
+                system=agentloop.build_system_prompt(
+                    system, workspace=box.workspace, sandbox_kind=box.kind
+                ),
+                prompt=prompt,
+            )
+            text = result.text
+            log.info(
+                "phase tool loop finished",
+                extra={
+                    "job_id": job_id,
+                    "phase_id": phase.id,
+                    "turns": result.turns,
+                    "commands": result.calls,
+                    "exhausted": result.exhausted,
+                },
+            )
+
         await self.store.record(
             job_id,
             "message",
-            {"content": completion.text, "phase_id": phase.id, "seq": phase.seq, "phase": phase.name},
+            {"content": text, "phase_id": phase.id, "seq": phase.seq, "phase": phase.name},
             source=role.id,
         )
-        return completion.text
+        return text
 
     async def _do_synthesis(
         self, job: Any, team: Team, provider: Provider, phase: PhaseRow, guidance: list[str]

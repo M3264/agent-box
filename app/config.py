@@ -34,6 +34,20 @@ def _env_path(name: str, default: Path) -> Path:
     return Path(raw).expanduser() if raw else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _env_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    return tuple(part.strip() for part in raw.replace(",", " ").split() if part.strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     root: Path = ROOT
@@ -62,6 +76,34 @@ class Settings:
     # under systemd's default TimeoutStopSec so `systemctl stop` never needs to
     # escalate to SIGKILL.
     shutdown_grace: int = field(default_factory=lambda: _env_int("AGENT_HUB_SHUTDOWN_GRACE", 10))
+
+    # -- agent tools ---------------------------------------------------------
+    # Off turns every phase back into a single text-only call, which is the
+    # pre-tools behaviour and the escape hatch if a provider misbehaves.
+    tools_enabled: bool = field(default_factory=lambda: _env_bool("AGENT_HUB_TOOLS", True))
+    #: Backend used by jobs that do not name one. Ships confined.
+    sandbox_default: str = field(default_factory=lambda: _env_str("AGENT_HUB_SANDBOX", "sandboxed"))
+    #: Provider round-trips per phase before the loop asks for a closing summary.
+    tool_max_turns: int = field(default_factory=lambda: _env_int("AGENT_HUB_TOOL_MAX_TURNS", 12))
+    #: Seconds a single command may run.
+    tool_timeout: int = field(default_factory=lambda: _env_int("AGENT_HUB_TOOL_TIMEOUT", 120))
+    #: Seconds a whole phase may spend in its tool loop, provider time included.
+    tool_wall_clock: int = field(default_factory=lambda: _env_int("AGENT_HUB_TOOL_WALL_CLOCK", 1800))
+    #: Bytes of each stream fed back to the model and stored on the row. The full
+    #: stream is always on disk in the workspace.
+    tool_output_limit: int = field(default_factory=lambda: _env_int("AGENT_HUB_TOOL_OUTPUT", 12000))
+    #: Hard ceiling before a command is killed for flooding, bytes.
+    tool_output_max: int = field(default_factory=lambda: _env_int("AGENT_HUB_TOOL_OUTPUT_MAX", 32 * 1024 * 1024))
+    #: Bytes a single read_file/write_file call may move.
+    tool_file_limit: int = field(default_factory=lambda: _env_int("AGENT_HUB_TOOL_FILE_LIMIT", 256 * 1024))
+    #: Commands share the host network by default — installing a dependency or
+    #: calling an API is most of what a CLI session is for.
+    tool_network: bool = field(default_factory=lambda: _env_bool("AGENT_HUB_TOOL_NETWORK", True))
+    #: Hosts `fetch` may reach. Empty means any, which is the default because the
+    #: shell already has the network; an allowlist here would be theatre.
+    fetch_allow_hosts: tuple[str, ...] = field(default_factory=lambda: _env_tuple("AGENT_HUB_FETCH_HOSTS", ()))
+    #: Seconds a single fetch may take.
+    fetch_timeout: int = field(default_factory=lambda: _env_int("AGENT_HUB_FETCH_TIMEOUT", 30))
 
     def ensure_dirs(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

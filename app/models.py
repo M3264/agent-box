@@ -8,6 +8,12 @@ from pydantic import BaseModel, Field, field_validator
 
 Mode = Literal["controlled", "yolo"]
 Decision = Literal["approved", "rejected"]
+Sandbox = Literal["sandboxed", "unconfined"]
+
+#: Job statuses nothing may write over with a non-terminal one. Lives here, with the
+#: other shared vocabulary, because both the engine and the tool loop need it and the
+#: engine imports the tool loop — so the tool loop cannot import it back from there.
+TERMINAL_JOB_STATUSES = frozenset({"complete", "error", "stopped"})
 
 
 class JobCreate(BaseModel):
@@ -18,6 +24,10 @@ class JobCreate(BaseModel):
     team_id: int | None = None
     mode: Mode = "controlled"
     provider_id: str | None = None
+    #: None means "use the server default at the moment the job starts". Recording
+    #: the resolved value on the row (rather than reading the setting per command)
+    #: is what keeps the audit trail honest if the default changes mid-job.
+    sandbox: Sandbox | None = None
 
     @field_validator("task")
     @classmethod

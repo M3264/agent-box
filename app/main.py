@@ -11,7 +11,9 @@ Startup order here is load-bearing:
 2. directories and the connection pool
 3. migrations, before anything reads a table
 4. provider bootstrap, so a fresh database is usable without manual setup
-5. recovery *last*, because resumed jobs immediately query the schema they need
+5. the sandbox probe, so no job can be handed a confinement backend that does not
+   work on this host — and so the UI can grey out the one that does not
+6. recovery *last*, because resumed jobs immediately query the schema they need
 
 Shutdown is the reverse: cancel in-flight jobs within a grace period well under
 systemd's stop timeout, park them as resumable, then close the pool.
@@ -35,6 +37,8 @@ from app.logging_setup import configure, get_logger
 from app.migrations import applied_versions, migrate
 from app.models import Health
 from app.orchestrator.providers import bootstrap_profiles
+from app.orchestrator.sandbox import probe as probe_sandboxes
+from app.orchestrator.sandbox import status as sandbox_status
 from app.deps import engine
 
 log = get_logger("agent_hub.main")
@@ -57,6 +61,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if applied:
         log.info("applied migrations", extra={"versions": applied})
     await bootstrap_profiles(db)
+
+    backends = await probe_sandboxes()
+    for kind, state in backends.items():
+        if not state.available:
+            log.warning("sandbox backend unavailable", extra={"sandbox": kind, "reason": state.reason})
 
     resumed = await engine.recover()
     log.info("startup complete", extra={"resumed_jobs": len(resumed)})
@@ -88,6 +97,14 @@ async def health() -> Health:
     detail: dict[str, object] = {
         "subscribers": stream_api.stream_stats()["subscribers"],
         "db_path": str(settings.db_path),
+        "tools_enabled": settings.tools_enabled,
+        "sandbox_default": settings.sandbox_default,
+        # Surfaced here because "sandboxed is unavailable" is the one degraded state
+        # that does not show up as an error until a job asks for it.
+        "sandboxes": {
+            kind: {"available": state.available, "reason": state.reason}
+            for kind, state in sandbox_status().items()
+        },
     }
     try:
         versions = await applied_versions(db)

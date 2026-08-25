@@ -34,6 +34,8 @@ function gist(event: JobEvent): string {
       return `${Array.isArray(payload.phases) ? payload.phases.length : 0} phases`
     case 'guidance':
       return `${Array.isArray(payload.messages) ? payload.messages.length : 0} operator messages`
+    case 'tool_call':
+      return `${value('display')} → ${value('status')}`
     case 'notice':
       return value('message')
     case 'error':

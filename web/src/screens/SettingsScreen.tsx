@@ -66,6 +66,7 @@ export function SettingsScreen() {
     <section className="screen settings">
       <Providers />
       <Teams />
+      <Tools />
 
       <section className="panel">
         <header className="panel-head">
@@ -108,6 +109,121 @@ export function SettingsScreen() {
           <Spinner label="Checking the service" />
         )}
       </section>
+    </section>
+  )
+}
+
+function Tools() {
+  const { data, error, loading } = usePoll(api.sandbox, 30_000)
+
+  if (error) {
+    return (
+      <section className="panel">
+        <header className="panel-head">
+          <h2>Agent tools</h2>
+        </header>
+        <ErrorNote>{error}</ErrorNote>
+      </section>
+    )
+  }
+  if (!data) {
+    return (
+      <section className="panel">
+        <header className="panel-head">
+          <h2>Agent tools</h2>
+        </header>
+        {loading ? <Spinner label="Reading the sandbox probe" /> : null}
+      </section>
+    )
+  }
+
+  return (
+    <section className="panel">
+      <header className="panel-head">
+        <h2>Agent tools</h2>
+        <span className={`pill pill-${data.tools_enabled ? 'good' : 'muted'}`}>
+          {data.tools_enabled ? 'enabled' : 'disabled'}
+        </span>
+      </header>
+
+      <p className="panel-note">
+        Specialists can run shell commands, read and write files, and fetch URLs inside
+        their job&apos;s workspace. Every call is recorded in the job&apos;s Commands tab;
+        commands matching a guardrail wait for an approval in both modes.
+      </p>
+
+      <table className="table">
+        <thead>
+          <tr>
+            <th scope="col">Confinement</th>
+            <th scope="col">State</th>
+            <th scope="col">What the probe found</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.backends.map((backend) => (
+            <tr key={backend.id}>
+              <th scope="row">
+                <span className="cell-title">{backend.label}</span>
+                <span className="cell-sub mono">
+                  {backend.id}
+                  {backend.id === data.default ? ' · default' : ''}
+                </span>
+              </th>
+              <td>
+                <span className={`pill pill-${backend.available ? 'good' : 'bad'}`}>
+                  {backend.available ? 'available' : 'unavailable'}
+                </span>
+              </td>
+              <td>{backend.reason}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {data.default_available === false ? (
+        <ErrorNote>
+          The default confinement ({data.default}) is unavailable on this host, so jobs that
+          do not pick another one will fail rather than run unconfined. Set
+          AGENT_HUB_SANDBOX to a working backend, or fix the one above.
+        </ErrorNote>
+      ) : null}
+
+      <dl className="facts">
+        <div>
+          <dt>Default</dt>
+          <dd className="mono">{data.default}</dd>
+        </div>
+        <div>
+          <dt>Network</dt>
+          <dd>{data.network ? 'reachable' : 'blocked'}</dd>
+        </div>
+        <div>
+          <dt>Turns per phase</dt>
+          <dd className="mono">{data.limits.max_turns}</dd>
+        </div>
+        <div>
+          <dt>Per command</dt>
+          <dd className="mono">{data.limits.command_timeout}s</dd>
+        </div>
+        <div>
+          <dt>Per phase</dt>
+          <dd className="mono">{data.limits.wall_clock}s</dd>
+        </div>
+        <div>
+          <dt>Kept per stream</dt>
+          <dd className="mono">{data.limits.output_limit} chars</dd>
+        </div>
+        <div className="wide">
+          <dt>Where these come from</dt>
+          <dd>
+            The service environment, not this screen — AGENT_HUB_SANDBOX,
+            AGENT_HUB_TOOLS, AGENT_HUB_TOOL_NETWORK and the AGENT_HUB_TOOL_* limits.
+            Confinement is a property of the host, so a job overrides it at creation
+            rather than an operator changing it under running jobs.
+          </dd>
+        </div>
+      </dl>
     </section>
   )
 }

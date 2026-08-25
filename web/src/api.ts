@@ -19,8 +19,11 @@ import type {
   Mode,
   Phase,
   Provider,
+  SandboxInfo,
+  SandboxKind,
   Team,
   TeamRole,
+  ToolCall,
 } from './types'
 
 /** `/hub` when served from the sub-path mount, otherwise the empty string. */
@@ -93,13 +96,24 @@ export const api = {
 
   jobs: (limit = 100) => request<JobSummary[]>(`/api/jobs?limit=${limit}`),
   job: (id: string) => request<JobSnapshot>(`/api/jobs/${id}`),
-  createJob: (payload: { task: string; mode: Mode; team_id?: number; provider_id?: string | null }) =>
-    request<{ id: string }>('/api/jobs', body(payload)),
+  createJob: (payload: {
+    task: string
+    mode: Mode
+    team_id?: number
+    provider_id?: string | null
+    sandbox?: SandboxKind | null
+  }) => request<{ id: string }>('/api/jobs', body(payload)),
 
   plan: (id: string) => request<Phase[]>(`/api/jobs/${id}/plan`),
   messages: (id: string) => request<JobMessage[]>(`/api/jobs/${id}/messages`),
   sendMessage: (id: string, content: string) =>
     request<JobMessage>(`/api/jobs/${id}/messages`, body({ content })),
+
+  toolCalls: (id: string, phaseId?: number) =>
+    request<ToolCall[]>(
+      `/api/jobs/${id}/tool-calls${phaseId ? `?phase_id=${phaseId}` : ''}`,
+    ),
+  toolCall: (id: string, callId: string) => request<ToolCall>(`/api/jobs/${id}/tool-calls/${callId}`),
 
   pause: (id: string) => request<JobAction>(`/api/jobs/${id}/pause`, { method: 'POST' }),
   resume: (id: string) => request<JobAction>(`/api/jobs/${id}/resume`, { method: 'POST' }),
@@ -128,4 +142,6 @@ export const api = {
   createTeam: (payload: { name: string; roles: TeamRole[] }) =>
     request<Team>('/api/teams', body(payload)),
   setDefaultTeam: (id: number) => request<Team>(`/api/teams/${id}/default`, { method: 'POST' }),
+
+  sandbox: () => request<SandboxInfo>('/api/sandbox'),
 }

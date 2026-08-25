@@ -21,7 +21,7 @@ export type Connection = 'connecting' | 'live' | 'reconnecting' | 'closed' | 'go
 
 const TERMINAL = new Set(['complete', 'error', 'stopped'])
 const RECONNECT_STEPS = [500, 1000, 2000, 5000, 10_000]
-const REFETCH_ON = new Set(['plan', 'phase', 'approval', 'artifact', 'guidance', 'message'])
+const REFETCH_ON = new Set(['plan', 'phase', 'approval', 'artifact', 'guidance', 'message', 'tool_call'])
 
 interface Frame {
   type: 'hello' | 'event' | 'ping' | 'end' | 'error'
@@ -77,6 +77,8 @@ export function useJobStream(jobId: string): JobStream {
             artifacts: snapshot.artifacts,
             messages: snapshot.messages,
             approvals: snapshot.approvals,
+            tool_calls: snapshot.tool_calls,
+            sandbox: snapshot.sandbox,
           },
     )
   }, [])
