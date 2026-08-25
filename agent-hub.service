@@ -8,9 +8,26 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/agent-hub
+
+# Provider secrets and deployment overrides. Leading '-' so a missing file is not
+# a startup failure: a profile's secret_ref also resolves from ~/.codex/config.toml,
+# and the service must still come up to report a broken profile in the UI rather
+# than refusing to boot.
+EnvironmentFile=-/etc/agent-hub.env
+
 ExecStart=/home/ubuntu/agent-hub/start.sh
-Restart=on-failure
+
+# Restart=always, not on-failure: a clean exit is never expected here. The old
+# on-failure setting meant any exit(0) — including the SIGKILL fallout of a stuck
+# shutdown — left the control plane down until someone noticed.
+Restart=always
 RestartSec=5
+
+# The engine parks in-flight jobs on SIGTERM within AGENT_HUB_SHUTDOWN_GRACE and
+# start.sh caps uvicorn at 20s, so 45s is a backstop, not the normal path. v1 hit
+# the 90s default on every stop and was SIGKILLed, which is what left phases
+# half-written.
+TimeoutStopSec=45
 
 [Install]
 WantedBy=multi-user.target

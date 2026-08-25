@@ -17,10 +17,18 @@ data/workspaces/
 web/node_modules/
 web/dist/
 
-# Vite build output, served by FastAPI
-static/assets/
+# The Vite build output IS what the service serves: neither start.sh nor the
+# systemd unit runs a build, so a clone without it has no UI. index.html also
+# hard-references a content-hashed bundle name, so ignoring assets/ while
+# tracking index.html would leave a fresh checkout pointing at a missing file.
+# Sourcemaps are the exception — 1.4MB regenerated on every build, and the source
+# they map is committed under web/src/ anyway.
+static/assets/*.map
 
 # Local env / secrets
 .env
 *.env
 !.env.example
+
+# TypeScript incremental build cache
+web/tsconfig.tsbuildinfo
