@@ -9,9 +9,18 @@ server-side from ``secret_ref`` — environment first, the codex config only as 
 fallback so the existing agentrouter profile keeps working. Secret *values* never
 enter the database and are never returned by the API.
 
-The ``Provider`` protocol keeps the call site provider-agnostic; only the
-OpenAI-compatible adapter is implemented, since that is what the configured
-endpoint speaks.
+Two axes, deliberately kept apart:
+
+- **Kind** is the wire protocol, and there is one adapter class per kind. Adding a
+  kind means writing code, so the catalogue lives here rather than in the database.
+- **Template** is a preset that fills a profile's fields in for a known vendor. It
+  needs no code, which is why there are many of them and why "which API does this
+  endpoint speak" stops being something an operator has to work out by watching a
+  job fail.
+
+A profile is also no longer one model. ``provider_profiles.model`` is its *default*
+model and ``provider_models`` holds the rest; a caller asks for a model by name and
+gets an adapter bound to it.
 """
 
 from __future__ import annotations
@@ -47,6 +56,212 @@ RETRYABLE_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 522, 524
 MAX_ATTEMPTS = 3
 #: Seconds to wait before attempt 2 and attempt 3.
 RETRY_BACKOFF = (2.0, 6.0)
+
+#: Anthropic pins its request/response shape to a dated version header.
+ANTHROPIC_VERSION = "2023-06-01"
+#: The Messages API requires ``max_tokens``; OpenAI-compatible endpoints do not.
+ANTHROPIC_DEFAULT_MAX_TOKENS = 8192
+
+
+# --------------------------------------------------------------------------- kinds
+
+#: The wire protocols with an adapter behind them.
+#:
+#: Each entry describes the dialect in the terms an operator sees elsewhere — most
+#: CLI agents and gateways describe themselves as "OpenAI compatible", so that is
+#: the label used here too. ``models_path`` is what discovery calls; a kind whose
+#: endpoint has no listing sets it to None and the operator types model ids in.
+PROVIDER_KINDS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "openai_compatible",
+        "label": "OpenAI compatible",
+        "detail": (
+            "POST {base_url}/chat/completions with a Bearer token. What OpenAI, "
+            "OpenRouter, Groq, Together, DeepSeek, vLLM, llama.cpp, LM Studio and "
+            "most gateways speak."
+        ),
+        "auth": "Authorization: Bearer <secret>",
+        "models_path": "/models",
+        "supports_tools": True,
+    },
+    {
+        "id": "anthropic",
+        "label": "Anthropic Messages",
+        "detail": (
+            "POST {base_url}/messages with an x-api-key header and a version header. "
+            "Tool calls use content blocks rather than a tool_calls array."
+        ),
+        "auth": "x-api-key: <secret>",
+        "models_path": "/models",
+        "supports_tools": True,
+    },
+)
+
+KIND_IDS = frozenset(kind["id"] for kind in PROVIDER_KINDS)
+
+#: Presets, not protocols. Picking one fills in the fields a new profile needs; the
+#: operator can still change every one of them afterwards. ``models`` are seeds for
+#: the model list, used when the endpoint has no discoverable listing or discovery
+#: is not reachable from this host.
+PROVIDER_TEMPLATES: tuple[dict[str, Any], ...] = (
+    {
+        "id": "openai",
+        "label": "OpenAI",
+        "kind": "openai_compatible",
+        "base_url": "https://api.openai.com/v1",
+        "secret_ref": "OPENAI_API_KEY",
+        "models": ["gpt-5.2", "gpt-5.2-mini", "gpt-4.1", "o4-mini"],
+        "headers": {},
+    },
+    {
+        "id": "anthropic",
+        "label": "Anthropic",
+        "kind": "anthropic",
+        "base_url": "https://api.anthropic.com/v1",
+        "secret_ref": "ANTHROPIC_API_KEY",
+        "models": ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
+        "headers": {},
+    },
+    {
+        "id": "openrouter",
+        "label": "OpenRouter",
+        "kind": "openai_compatible",
+        "base_url": "https://openrouter.ai/api/v1",
+        "secret_ref": "OPENROUTER_API_KEY",
+        "models": [],
+        "headers": {},
+    },
+    {
+        "id": "groq",
+        "label": "Groq",
+        "kind": "openai_compatible",
+        "base_url": "https://api.groq.com/openai/v1",
+        "secret_ref": "GROQ_API_KEY",
+        "models": [],
+        "headers": {},
+    },
+    {
+        "id": "deepseek",
+        "label": "DeepSeek",
+        "kind": "openai_compatible",
+        "base_url": "https://api.deepseek.com/v1",
+        "secret_ref": "DEEPSEEK_API_KEY",
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "headers": {},
+    },
+    {
+        "id": "together",
+        "label": "Together AI",
+        "kind": "openai_compatible",
+        "base_url": "https://api.together.xyz/v1",
+        "secret_ref": "TOGETHER_API_KEY",
+        "models": [],
+        "headers": {},
+    },
+    {
+        "id": "mistral",
+        "label": "Mistral",
+        "kind": "openai_compatible",
+        "base_url": "https://api.mistral.ai/v1",
+        "secret_ref": "MISTRAL_API_KEY",
+        "models": [],
+        "headers": {},
+    },
+    {
+        "id": "gemini_openai",
+        "label": "Google Gemini (OpenAI endpoint)",
+        "kind": "openai_compatible",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "secret_ref": "GEMINI_API_KEY",
+        "models": ["gemini-2.5-pro", "gemini-2.5-flash"],
+        "headers": {},
+    },
+    {
+        "id": "ollama",
+        "label": "Ollama (local)",
+        "kind": "openai_compatible",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "secret_ref": None,
+        "models": [],
+        "headers": {},
+    },
+    {
+        "id": "lmstudio",
+        "label": "LM Studio (local)",
+        "kind": "openai_compatible",
+        "base_url": "http://127.0.0.1:1234/v1",
+        "secret_ref": None,
+        "models": [],
+        "headers": {},
+    },
+    {
+        "id": "vllm",
+        "label": "vLLM / self-hosted",
+        "kind": "openai_compatible",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "secret_ref": None,
+        "models": [],
+        "headers": {},
+    },
+    {
+        "id": "custom",
+        "label": "Something else, OpenAI compatible",
+        "kind": "openai_compatible",
+        "base_url": "https://",
+        "secret_ref": None,
+        "models": [],
+        "headers": {},
+    },
+)
+
+
+def normalize_usage(usage: dict[str, Any] | None) -> dict[str, int]:
+    """Flatten whatever an endpoint reported into one shape.
+
+    OpenAI-compatible endpoints send ``prompt_tokens``/``completion_tokens``;
+    Anthropic sends ``input_tokens``/``output_tokens``; both nest their cached and
+    reasoning counts differently, and plenty of gateways send neither. Every field
+    is optional, so a missing count reads as 0 rather than breaking accounting.
+    """
+    if not isinstance(usage, dict):
+        return {"prompt": 0, "completion": 0, "total": 0, "cached": 0, "reasoning": 0}
+
+    def number(*keys: str) -> int:
+        for key in keys:
+            value = usage.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                return int(value)
+        return 0
+
+    def nested(section: str, *keys: str) -> int:
+        detail = usage.get(section)
+        if not isinstance(detail, dict):
+            return 0
+        for key in keys:
+            value = detail.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return int(value)
+        return 0
+
+    prompt = number("prompt_tokens", "input_tokens")
+    completion = number("completion_tokens", "output_tokens")
+    cached = number("cached_tokens", "cache_read_input_tokens") or nested(
+        "prompt_tokens_details", "cached_tokens"
+    )
+    reasoning = number("reasoning_tokens") or nested(
+        "completion_tokens_details", "reasoning_tokens"
+    )
+    total = number("total_tokens") or (prompt + completion)
+    return {
+        "prompt": prompt,
+        "completion": completion,
+        "total": total,
+        "cached": cached,
+        "reasoning": reasoning,
+    }
+
 
 
 @dataclass(slots=True)
@@ -345,6 +560,229 @@ class OpenAICompatibleProvider:
         )
 
 
+class AnthropicProvider:
+    """Adapter for the Anthropic Messages API.
+
+    Kept as its own class rather than a flag on the OpenAI adapter because three
+    things differ in ways that do not compose: authentication is a header of its
+    own, ``max_tokens`` is required rather than optional, and tool use is expressed
+    as content blocks inside a message instead of a sibling ``tool_calls`` array.
+    Translating in both directions is the whole job of this class, so the engine and
+    the tool loop keep speaking one internal shape.
+    """
+
+    def __init__(
+        self,
+        *,
+        id: str,
+        base_url: str,
+        model: str,
+        secret: str | None,
+        headers: dict[str, str] | None = None,
+        client: httpx.AsyncClient | None = None,
+        supports_tools: bool = True,
+        max_tokens: int = ANTHROPIC_DEFAULT_MAX_TOKENS,
+    ) -> None:
+        self.id = id
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self._secret = secret
+        self._headers = headers or {}
+        self._client = client
+        self._owns_client = client is None
+        self.supports_tools = supports_tools
+        self._max_tokens = max_tokens
+
+    async def __aenter__(self) -> AnthropicProvider:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    settings.provider_timeout, connect=settings.provider_connect_timeout
+                )
+            )
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def complete(
+        self,
+        *,
+        system: str,
+        messages: list[Message],
+        temperature: float = 0.2,
+        max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> Completion:
+        if self._client is None:
+            raise ProviderConfigError("provider used outside its async context")
+
+        headers = {
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+            **self._headers,
+        }
+        if self._secret:
+            headers["x-api-key"] = self._secret
+
+        body: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_tokens or self._max_tokens,
+            "temperature": temperature,
+            "messages": _to_anthropic_messages(messages),
+        }
+        if system:
+            body["system"] = system
+        if tools and self.supports_tools:
+            body["tools"] = [_to_anthropic_tool(tool) for tool in tools]
+
+        failure: ProviderError | None = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                response = await self._client.post(
+                    f"{self.base_url}/messages", headers=headers, json=body
+                )
+            except httpx.HTTPError as exc:
+                failure = ProviderError(f"provider request failed: {exc}")
+            else:
+                if response.status_code < 400:
+                    return self._parse(response)
+                failure = ProviderError(
+                    f"provider returned HTTP {response.status_code}: {response.text[:500]}"
+                )
+                if not _retryable(response):
+                    raise failure
+
+            if attempt < MAX_ATTEMPTS:
+                delay = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF)) - 1]
+                log.warning(
+                    "retrying provider call",
+                    extra={
+                        "provider": self.id,
+                        "attempt": attempt,
+                        "of": MAX_ATTEMPTS,
+                        "retry_in": delay,
+                        "error": str(failure),
+                    },
+                )
+                await asyncio.sleep(delay)
+
+        raise failure if failure is not None else ProviderError("provider call failed")
+
+    def _parse(self, response: httpx.Response) -> Completion:
+        try:
+            data = response.json()
+            blocks = data["content"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ProviderError(f"unexpected provider response shape: {exc}") from exc
+        if not isinstance(blocks, list):
+            raise ProviderError("unexpected provider response shape: content is not a list")
+
+        texts: list[str] = []
+        calls: list[ToolCallRequest] = []
+        for index, block in enumerate(blocks):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                texts.append(block["text"])
+            elif block.get("type") == "tool_use" and block.get("name"):
+                calls.append(
+                    ToolCallRequest(
+                        id=str(block.get("id") or f"call_{index}"),
+                        name=str(block["name"]),
+                        arguments=json.dumps(block.get("input") or {}),
+                    )
+                )
+
+        text = "\n".join(part for part in texts if part)
+        if not text and not calls:
+            raise ProviderError("provider returned an empty message")
+
+        return Completion(
+            text=text,
+            model=data.get("model", self.model),
+            usage=data.get("usage") or {},
+            tool_calls=calls,
+            finish_reason=data.get("stop_reason"),
+        )
+
+
+def _to_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    """Translate one OpenAI-shaped function schema into Anthropic's tool shape.
+
+    The tool schemas live in ``tools.py`` in OpenAI's form because that is what most
+    endpoints take; this is the only place that has to know the other spelling.
+    """
+    function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    return {
+        "name": function.get("name", ""),
+        "description": function.get("description", ""),
+        "input_schema": function.get("parameters") or {"type": "object", "properties": {}},
+    }
+
+
+def _to_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:
+    """Translate the internal conversation into Anthropic's block form.
+
+    Two shape rules the Messages API enforces and the OpenAI form does not:
+    a tool result is a *user* message carrying a ``tool_result`` block rather than
+    its own ``tool`` role, and same-role turns must be merged rather than repeated.
+    Both are handled here so no caller has to care which dialect it is talking to.
+    """
+    turns: list[dict[str, Any]] = []
+
+    def append(role: str, blocks: list[dict[str, Any]]) -> None:
+        if not blocks:
+            return
+        if turns and turns[-1]["role"] == role:
+            turns[-1]["content"].extend(blocks)
+        else:
+            turns.append({"role": role, "content": blocks})
+
+    for message in messages:
+        if message.role == "tool":
+            append(
+                "user",
+                [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": message.tool_call_id or "",
+                        "content": message.content or "",
+                    }
+                ],
+            )
+            continue
+
+        blocks: list[dict[str, Any]] = []
+        if message.content:
+            blocks.append({"type": "text", "text": message.content})
+        for call in message.tool_calls:
+            arguments = call.args()
+            # `args()` returns a marker dict when the model's own JSON was
+            # unparseable. Echoing that back is more honest than dropping the block:
+            # the conversation stays well-formed and the model sees what it sent.
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": arguments,
+                }
+            )
+        # A system message reaching here means a caller put one in the list rather
+        # than the `system` parameter; Anthropic has no system role, so it is folded
+        # into the user turn instead of being silently discarded.
+        append("user" if message.role == "system" else message.role, blocks)
+
+    if not turns:
+        # The API rejects an empty conversation; an empty user turn is closer to the
+        # caller's intent than a 400.
+        return [{"role": "user", "content": [{"type": "text", "text": ""}]}]
+    return turns
+
+
 def _parse_tool_calls(raw: Any) -> list[ToolCallRequest]:
     """Read the ``tool_calls`` array, skipping anything malformed.
 
@@ -399,20 +837,210 @@ async def load_profile(database: Database, provider_id: str | None = None) -> di
     return profile
 
 
-def build_provider(profile: dict[str, Any], client: httpx.AsyncClient | None = None) -> Provider:
+def kind_spec(kind: str | None) -> dict[str, Any]:
+    """The catalogue entry for a kind, defaulting to the OpenAI dialect.
+
+    Profiles written before the kind column existed have no kind, and an operator can
+    only ever pick from the catalogue, so an unknown value means the row predates the
+    column rather than that it is wrong.
+    """
+    for entry in PROVIDER_KINDS:
+        if entry["id"] == kind:
+            return entry
+    return PROVIDER_KINDS[0]
+
+
+#: One adapter class per wire protocol. Adding a kind means adding a class, which is
+#: exactly why this mapping is code and not configuration.
+_ADAPTERS: dict[str, Any] = {
+    "openai_compatible": OpenAICompatibleProvider,
+    "anthropic": AnthropicProvider,
+}
+
+
+def build_provider(
+    profile: dict[str, Any],
+    client: httpx.AsyncClient | None = None,
+    *,
+    model: str | None = None,
+) -> Provider:
+    """Build an adapter for one profile, optionally bound to a non-default model.
+
+    ``model`` is what makes a profile more than a single model: the profile supplies
+    the endpoint, the credentials and the dialect, and the caller says which model on
+    that endpoint it wants. Falling back to ``profile["model"]`` keeps every existing
+    caller — and every job created before per-agent assignment — working unchanged.
+    """
     kind = profile.get("kind") or "openai_compatible"
-    if kind != "openai_compatible":
+    adapter = _ADAPTERS.get(kind)
+    if adapter is None:
         raise ProviderConfigError(f"unsupported provider kind '{kind}'")
-    return OpenAICompatibleProvider(
+
+    chosen = (model or profile.get("model") or "").strip()
+    if not chosen:
+        raise ProviderConfigError(
+            f"provider '{profile['id']}' has no model; add one in Settings"
+        )
+
+    return adapter(
         id=profile["id"],
         base_url=profile["base_url"],
-        model=profile["model"],
+        model=chosen,
         secret=resolve_secret(profile.get("secret_ref"), profile["id"]),
         headers=profile.get("headers") or {},
         client=client,
         # Defaults on for profiles predating the column.
         supports_tools=bool(profile.get("supports_tools", 1)),
     )
+
+
+class ProviderPool:
+    """The adapters one job needs, built once and shared.
+
+    A job used to resolve exactly one provider for its whole run. Now each agent may
+    name its own provider and model, so a phase asks the pool for what its owner
+    should speak to and gets a cached adapter back — one per distinct
+    ``(provider, model)`` pair, not one per phase.
+
+    All of them share a single ``httpx.AsyncClient`` owned by the pool, so connection
+    reuse survives across agents and there is exactly one thing to close. Adapters are
+    constructed with that client, which means their own ``__aenter__``/``__aexit__``
+    are never needed and they never close a connection another agent is using.
+    """
+
+    __slots__ = ("_db", "_default_provider_id", "_client", "_owns_client", "_profiles", "_adapters")
+
+    def __init__(
+        self,
+        database: Database,
+        *,
+        default_provider_id: str | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._db = database
+        self._default_provider_id = default_provider_id
+        self._client = client
+        self._owns_client = client is None
+        self._profiles: dict[str | None, dict[str, Any]] = {}
+        self._adapters: dict[tuple[str, str], Provider] = {}
+
+    async def __aenter__(self) -> ProviderPool:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    settings.provider_timeout, connect=settings.provider_connect_timeout
+                )
+            )
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+        self._client = None
+        self._adapters.clear()
+
+    async def profile(self, provider_id: str | None = None) -> dict[str, Any]:
+        """The profile row for an id, cached for the life of the pool.
+
+        Cached because a job with six phases would otherwise re-read and re-resolve
+        the same secret six times. A profile disabled mid-job therefore keeps working
+        until the job ends, which is the same guarantee the single-provider version
+        gave.
+        """
+        key = provider_id or self._default_provider_id
+        if key not in self._profiles:
+            self._profiles[key] = await load_profile(self._db, key)
+        return self._profiles[key]
+
+    async def get(self, provider_id: str | None = None, model: str | None = None) -> Provider:
+        """An adapter for one ``(provider, model)`` pair.
+
+        A pinned provider that has since been disabled or deleted raises rather than
+        quietly falling back to the job's default. Running an agent on a model the
+        operator did not choose, without saying so, is the same class of mistake as
+        running a command unsandboxed because the sandbox was missing.
+        """
+        profile = await self.profile(provider_id)
+        chosen = (model or profile.get("model") or "").strip()
+        key = (profile["id"], chosen)
+        if key not in self._adapters:
+            self._adapters[key] = build_provider(profile, self._client, model=chosen)
+        return self._adapters[key]
+
+
+async def discover_models(
+    profile: dict[str, Any], client: httpx.AsyncClient | None = None
+) -> list[dict[str, Any]]:
+    """Ask an endpoint which models it serves.
+
+    This is the other half of the detection problem: knowing the dialect tells you how
+    to call an endpoint, and this tells you what to call it with, so an operator does
+    not have to paste model ids from documentation that may not match what their
+    gateway actually proxies.
+
+    Returns ``[{"model", "label"}]``. Raises ``ProviderError`` when the endpoint has no
+    listing or refuses the request — the caller shows that reason and the operator adds
+    models by hand, which every provider form still allows.
+    """
+    spec = kind_spec(profile.get("kind"))
+    path = spec.get("models_path")
+    if not path:
+        raise ProviderError(f"{spec['label']} endpoints have no model listing to read")
+
+    secret = resolve_secret(profile.get("secret_ref"), profile["id"])
+    headers = dict(profile.get("headers") or {})
+    if secret:
+        if spec["id"] == "anthropic":
+            headers["x-api-key"] = secret
+            headers["anthropic-version"] = ANTHROPIC_VERSION
+        else:
+            headers["Authorization"] = f"Bearer {secret}"
+
+    url = f"{str(profile['base_url']).rstrip('/')}{path}"
+    owns = client is None
+    http = client or httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, connect=settings.provider_connect_timeout)
+    )
+    try:
+        response = await http.get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        raise ProviderError(f"could not reach {url}: {exc}") from exc
+    finally:
+        if owns:
+            await http.aclose()
+
+    if response.status_code >= 400:
+        raise ProviderError(
+            f"{url} returned HTTP {response.status_code}: {response.text[:300]}"
+        )
+    try:
+        data = response.json()
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"{url} did not return JSON: {exc}") from exc
+
+    # OpenAI wraps the list in `data`; a few self-hosted servers return a bare array.
+    entries = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        raise ProviderError(f"{url} returned an unexpected shape")
+
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if isinstance(entry, str):
+            model, label = entry, None
+        elif isinstance(entry, dict):
+            model = entry.get("id") or entry.get("name") or entry.get("model")
+            label = entry.get("display_name") or entry.get("label")
+        else:
+            continue
+        model = str(model or "").strip()
+        if not model or model in seen:
+            continue
+        seen.add(model)
+        found.append({"model": model, "label": str(label).strip() if label else None})
+
+    found.sort(key=lambda item: item["model"])
+    return found
 
 
 async def bootstrap_profiles(database: Database) -> None:
@@ -443,19 +1071,28 @@ async def bootstrap_profiles(database: Database) -> None:
         log.info("codex config has no usable provider section", extra={"provider": name})
         return
 
-    await database.execute(
-        "insert into provider_profiles(id,label,kind,base_url,model,secret_ref,headers,enabled,created_at)"
-        " values(?,?,?,?,?,?,?,1,unixepoch('subsec'))",
-        (
-            name,
-            name.replace("_", " ").title(),
-            "openai_compatible",
-            base_url.rstrip("/"),
-            data.get("model") or "gpt-5.6-sol",
-            "experimental_bearer_token" if "experimental_bearer_token" in section else None,
-            json.dumps({"originator": "codex_cli_rs"}),
-        ),
-    )
+    model = data.get("model") or "gpt-5.6-sol"
+    async with database.transaction() as conn:
+        await conn.execute(
+            "insert into provider_profiles(id,label,kind,base_url,model,secret_ref,headers,enabled,created_at)"
+            " values(?,?,?,?,?,?,?,1,unixepoch('subsec'))",
+            (
+                name,
+                name.replace("_", " ").title(),
+                "openai_compatible",
+                base_url.rstrip("/"),
+                model,
+                "experimental_bearer_token" if "experimental_bearer_token" in section else None,
+                json.dumps({"originator": "codex_cli_rs"}),
+            ),
+        )
+        # The seeded default is also the profile's first selectable model, so the model
+        # picker is never empty on a fresh install.
+        await conn.execute(
+            "insert into provider_models(provider_id,model,label,supports_tools,created_at)"
+            " values(?,?,null,1,unixepoch('subsec'))",
+            (name, model),
+        )
     log.info("seeded provider profile from codex config", extra={"provider": name, "base_url": base_url})
 
 

@@ -9,34 +9,64 @@
  * environment variable and the server resolves it at call time. `secret_ok` is how
  * this screen can say "that reference resolves" without the value ever leaving the
  * server.
+ *
+ * The provider form asks two separate questions that used to be one. *Which protocol*
+ * does the endpoint speak — answered from the short list of adapters this build has,
+ * because guessing it from a URL is what made detection unreliable. And *which
+ * models* does it serve — a list, not a field, because one endpoint serves many and
+ * a profile pinned to a single model made "use the cheap one for this agent"
+ * impossible to express. A vendor template answers both at once for the common cases.
  */
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { ApiError, api } from '../api'
 import { Empty, ErrorNote, Spinner } from '../components/ui'
 import { usePoll } from '../hooks/usePoll'
 import { fullTime } from '../lib/format'
-import type { Provider, Team, TeamRole } from '../types'
+import type {
+  DiscoveredModels,
+  Provider,
+  ProviderKind,
+  ProviderTemplate,
+  Team,
+  TeamRole,
+} from '../types'
+
+interface ModelDraft {
+  model: string
+  label: string
+  supports_tools: boolean
+}
 
 interface ProviderDraft {
   id: string
   label: string
+  kind: string
   base_url: string
+  /** The default model. Always one of `models`; the radio column sets it. */
   model: string
+  models: ModelDraft[]
   secret_ref: string
   headers: string
   enabled: boolean
+  supports_tools: boolean
+  /** False for a profile being created, which is why discovery is unavailable. */
+  existing: boolean
 }
 
 const BLANK_PROVIDER: ProviderDraft = {
   id: '',
   label: '',
+  kind: 'openai_compatible',
   base_url: 'https://',
   model: '',
+  models: [],
   secret_ref: '',
   headers: '{}',
   enabled: true,
+  supports_tools: true,
+  existing: false,
 }
 
 const BLANK_ROLE: TeamRole = { id: '', name: '', instructions: '', orchestrator: false }
@@ -45,11 +75,36 @@ function toDraft(profile: Provider): ProviderDraft {
   return {
     id: profile.id,
     label: profile.label,
+    kind: profile.kind,
     base_url: profile.base_url,
     model: profile.model,
+    models: profile.models.map((entry) => ({
+      model: entry.model,
+      label: entry.label ?? '',
+      supports_tools: entry.supports_tools,
+    })),
     secret_ref: profile.secret_ref ?? '',
     headers: JSON.stringify(profile.headers, null, 2),
     enabled: profile.enabled,
+    supports_tools: profile.supports_tools,
+    existing: true,
+  }
+}
+
+/** Fill a blank draft from a vendor preset. Nothing here is unchangeable afterwards. */
+function fromTemplate(template: ProviderTemplate, current: ProviderDraft): ProviderDraft {
+  return {
+    ...current,
+    // Only fill an id and label the operator has not typed: picking a template to
+    // correct the base URL of a half-filled form should not rename it.
+    id: current.id || template.id,
+    label: current.label || template.label,
+    kind: template.kind,
+    base_url: template.base_url,
+    secret_ref: template.secret_ref ?? '',
+    headers: JSON.stringify(template.headers, null, 2),
+    models: template.models.map((model) => ({ model, label: '', supports_tools: true })),
+    model: template.models[0] ?? '',
   }
 }
 
@@ -231,10 +286,87 @@ function Tools() {
 function Providers() {
   const { data, error, loading, reload } = usePoll(api.providers, 20_000)
   const [draft, setDraft] = useState<ProviderDraft | null>(null)
+  const [kinds, setKinds] = useState<ProviderKind[]>([])
+  const [templates, setTemplates] = useState<ProviderTemplate[]>([])
   const [busy, setBusy] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
+  const [found, setFound] = useState<DiscoveredModels | null>(null)
+  const [discovering, setDiscovering] = useState(false)
 
   const providers = data ?? []
+
+  // The catalogues change with a deploy, not with a click, so one fetch is enough.
+  useEffect(() => {
+    void Promise.all([api.providerKinds(), api.providerTemplates()])
+      .then(([loadedKinds, loadedTemplates]) => {
+        setKinds(loadedKinds)
+        setTemplates(loadedTemplates)
+      })
+      .catch(() => undefined)
+  }, [])
+
+  const kind = kinds.find((entry) => entry.id === draft?.kind) ?? null
+
+  const open = (next: ProviderDraft | null) => {
+    setDraft(next)
+    setFound(null)
+    setFormError(null)
+  }
+
+  const patchModel = (index: number, changes: Partial<ModelDraft>) =>
+    setDraft((current) => {
+      if (!current) return current
+      const models = current.models.map((entry, position) =>
+        position === index ? { ...entry, ...changes } : entry,
+      )
+      // Renaming the model that was the default keeps it the default, rather than
+      // silently pointing the profile at a model id that no longer exists.
+      const renamed =
+        changes.model !== undefined && current.models[index]?.model === current.model
+          ? changes.model
+          : current.model
+      return { ...current, models, model: renamed }
+    })
+
+  const removeModel = (index: number) =>
+    setDraft((current) => {
+      if (!current) return current
+      const gone = current.models[index]?.model
+      const models = current.models.filter((_, position) => position !== index)
+      return {
+        ...current,
+        models,
+        model: gone === current.model ? (models[0]?.model ?? '') : current.model,
+      }
+    })
+
+  const addModels = (names: string[]) =>
+    setDraft((current) => {
+      if (!current) return current
+      const have = new Set(current.models.map((entry) => entry.model))
+      const added = names
+        .filter((name) => !have.has(name))
+        .map((name) => ({ model: name, label: '', supports_tools: true }))
+      const models = [...current.models, ...added]
+      return { ...current, models, model: current.model || (models[0]?.model ?? '') }
+    })
+
+  const discover = async () => {
+    if (!draft) return
+    setDiscovering(true)
+    setFormError(null)
+    try {
+      setFound(await api.discoverModels(draft.id))
+    } catch (cause) {
+      setFormError(
+        cause instanceof ApiError
+          ? `discovery failed: ${cause.message}`
+          : 'could not reach that endpoint',
+      )
+    } finally {
+      setDiscovering(false)
+    }
+  }
 
   const save = async (event: FormEvent) => {
     event.preventDefault()
@@ -255,18 +387,36 @@ function Providers() {
       return
     }
 
+    const models = draft.models
+      .map((entry) => ({
+        model: entry.model.trim(),
+        label: entry.label.trim() || null,
+        supports_tools: entry.supports_tools,
+      }))
+      .filter((entry) => entry.model !== '')
+
+    if (models.length === 0) {
+      // The server enforces this too, but a profile with no model saves cleanly and
+      // then fails on the first call of every job that uses it — worth catching here.
+      setFormError('add at least one model; a profile with none cannot run a job')
+      setBusy(false)
+      return
+    }
+
     try {
       await api.saveProvider({
         id: draft.id.trim(),
         label: draft.label.trim(),
-        kind: 'openai_compatible',
+        kind: draft.kind,
         base_url: draft.base_url.trim(),
-        model: draft.model.trim(),
+        model: draft.model.trim() || models[0].model,
+        models,
         secret_ref: draft.secret_ref.trim() || null,
         headers,
         enabled: draft.enabled,
+        supports_tools: draft.supports_tools,
       })
-      setDraft(null)
+      open(null)
       await reload()
     } catch (cause) {
       setFormError(cause instanceof ApiError ? cause.message : 'could not save that profile')
@@ -299,7 +449,7 @@ function Providers() {
         <button
           type="button"
           className="button"
-          onClick={() => setDraft(draft === null ? { ...BLANK_PROVIDER } : null)}
+          onClick={() => open(draft === null ? { ...BLANK_PROVIDER } : null)}
         >
           {draft === null ? 'Add profile' : 'Cancel'}
         </button>
@@ -310,6 +460,31 @@ function Providers() {
 
       {draft !== null ? (
         <form className="form" onSubmit={save}>
+          {!draft.existing ? (
+            <label className="field">
+              <span>Start from</span>
+              <select
+                value=""
+                onChange={(event) => {
+                  const template = templates.find((entry) => entry.id === event.target.value)
+                  if (template) setDraft((current) => (current ? fromTemplate(template, current) : current))
+                }}
+              >
+                <option value="">A preset, or fill it in by hand…</option>
+                {templates.map((template) => (
+                  <option key={template.id} value={template.id}>
+                    {template.label}
+                    {template.models.length > 0 ? ` — ${template.models.length} models` : ''}
+                  </option>
+                ))}
+              </select>
+              <small>
+                Presets only fill the form. Every field stays editable, and nothing is saved
+                until you say so.
+              </small>
+            </label>
+          ) : null}
+
           <div className="field-row">
             <label className="field">
               <span>Id</span>
@@ -318,8 +493,10 @@ function Providers() {
                 onChange={(event) => setDraft({ ...draft, id: event.target.value })}
                 placeholder="agentrouter"
                 pattern="[A-Za-z0-9._\-]+"
+                readOnly={draft.existing}
                 required
               />
+              {draft.existing ? <small>Ids are permanent — jobs reference them.</small> : null}
             </label>
             <label className="field">
               <span>Label</span>
@@ -334,6 +511,24 @@ function Providers() {
 
           <div className="field-row">
             <label className="field">
+              <span>API type</span>
+              <select
+                value={draft.kind}
+                onChange={(event) => setDraft({ ...draft, kind: event.target.value })}
+              >
+                {kinds.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {entry.label}
+                  </option>
+                ))}
+              </select>
+              {kind ? (
+                <small>
+                  {kind.detail} Auth: <code>{kind.auth}</code>
+                </small>
+              ) : null}
+            </label>
+            <label className="field">
               <span>Base URL</span>
               <input
                 value={draft.base_url}
@@ -341,17 +536,176 @@ function Providers() {
                 placeholder="https://api.example.com/v1"
                 required
               />
-            </label>
-            <label className="field">
-              <span>Model</span>
-              <input
-                value={draft.model}
-                onChange={(event) => setDraft({ ...draft, model: event.target.value })}
-                placeholder="gpt-5.6-sol"
-                required
-              />
+              <small>
+                No trailing path beyond the version prefix — the adapter appends its own
+                endpoint.
+              </small>
             </label>
           </div>
+
+          <fieldset className="models-editor">
+            <legend>
+              Models
+              <span className="muted">
+                {draft.models.length === 0
+                  ? 'none yet'
+                  : `${draft.models.length} listed · default is ${draft.model || '—'}`}
+              </span>
+            </legend>
+
+            {draft.models.length === 0 ? (
+              <p className="field-note">
+                A provider serves many models and a job picks one per agent. Add the ones you
+                want offered.
+              </p>
+            ) : (
+              <table className="models-table">
+                <thead>
+                  <tr>
+                    <th scope="col" className="right">
+                      Default
+                    </th>
+                    <th scope="col">Model id</th>
+                    <th scope="col">Label (optional)</th>
+                    <th scope="col">Tools</th>
+                    <th scope="col" aria-label="Remove" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {draft.models.map((entry, index) => (
+                    <tr key={index}>
+                      <td className="right">
+                        <input
+                          type="radio"
+                          name="default-model"
+                          aria-label={`Make ${entry.model || 'this model'} the default`}
+                          checked={draft.model === entry.model && entry.model !== ''}
+                          onChange={() => setDraft({ ...draft, model: entry.model })}
+                        />
+                      </td>
+                      <td>
+                        <input
+                          className="mono"
+                          value={entry.model}
+                          onChange={(event) => patchModel(index, { model: event.target.value })}
+                          placeholder="gpt-5.2-mini"
+                          aria-label={`Model id ${index + 1}`}
+                        />
+                      </td>
+                      <td>
+                        <input
+                          value={entry.label}
+                          onChange={(event) => patchModel(index, { label: event.target.value })}
+                          placeholder="Cheap and fast"
+                          aria-label={`Label for model ${index + 1}`}
+                        />
+                      </td>
+                      <td>
+                        <label className="check tight">
+                          <input
+                            type="checkbox"
+                            checked={entry.supports_tools}
+                            disabled={!draft.supports_tools}
+                            onChange={(event) =>
+                              patchModel(index, { supports_tools: event.target.checked })
+                            }
+                          />
+                          <span className="sr-only">
+                            {entry.model || `model ${index + 1}`} can call tools
+                          </span>
+                        </label>
+                      </td>
+                      <td className="right">
+                        <button
+                          type="button"
+                          className="icon-button"
+                          aria-label={`Remove ${entry.model || `model ${index + 1}`}`}
+                          onClick={() => removeModel(index)}
+                        >
+                          ✕
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+
+            <div className="models-foot">
+              <button
+                type="button"
+                className="button ghost"
+                onClick={() => addModels([''])}
+                disabled={draft.models.some((entry) => entry.model === '')}
+              >
+                Add model
+              </button>
+              <button
+                type="button"
+                className="button ghost"
+                onClick={() => void discover()}
+                disabled={!draft.existing || discovering}
+                title={
+                  draft.existing
+                    ? `Ask the endpoint what it serves${kind?.models_path ? ` (GET ${kind.models_path})` : ''}`
+                    : 'Save the profile first — discovery calls the endpoint with its stored credentials'
+                }
+              >
+                {discovering ? 'Asking the endpoint…' : 'Discover models'}
+              </button>
+              {!draft.existing ? (
+                <span className="muted">Discovery needs a saved profile with its secret.</span>
+              ) : null}
+            </div>
+
+            {found ? (
+              <div className="discovered">
+                <p className="discovered-head">
+                  {found.count} model{found.count === 1 ? '' : 's'} on the endpoint.
+                  {found.models.some((entry) => !entry.known) ? (
+                    <button
+                      type="button"
+                      className="button ghost"
+                      onClick={() =>
+                        addModels(
+                          found.models.filter((entry) => !entry.known).map((entry) => entry.model),
+                        )
+                      }
+                    >
+                      Add all {found.models.filter((entry) => !entry.known).length} new
+                    </button>
+                  ) : null}
+                  <button type="button" className="button ghost" onClick={() => setFound(null)}>
+                    Dismiss
+                  </button>
+                </p>
+                <ul className="discovered-list">
+                  {found.models.map((entry) => {
+                    const listed =
+                      entry.known || draft.models.some((row) => row.model === entry.model)
+                    return (
+                      <li key={entry.model}>
+                        <button
+                          type="button"
+                          className={`chip ${listed ? 'chip-on' : ''}`}
+                          disabled={listed}
+                          onClick={() => addModels([entry.model])}
+                          title={listed ? 'Already listed' : 'Add to this profile'}
+                        >
+                          <span className="mono">{entry.model}</span>
+                          {listed ? ' ✓' : ' +'}
+                        </button>
+                      </li>
+                    )
+                  })}
+                </ul>
+                <p className="field-note">
+                  Nothing was saved. Pick what you want offered — a gateway listing hundreds of
+                  models would turn the job form into a haystack.
+                </p>
+              </div>
+            ) : null}
+          </fieldset>
 
           <div className="field-row">
             <label className="field">
@@ -386,8 +740,22 @@ function Providers() {
             <span>Enabled — selectable when creating a job</span>
           </label>
 
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={draft.supports_tools}
+              onChange={(event) => setDraft({ ...draft, supports_tools: event.target.checked })}
+            />
+            <span>
+              Endpoint accepts tool calls — off for one that rejects the <code>tools</code>{' '}
+              parameter outright, which makes its agents talk instead of run
+            </span>
+          </label>
+
           <div className="form-foot">
-            <span className="muted">kind: openai_compatible</span>
+            <button type="button" className="button ghost" onClick={() => open(null)}>
+              Cancel
+            </button>
             <button type="submit" className="button primary" disabled={busy}>
               {busy ? 'Saving…' : 'Save profile'}
             </button>
@@ -406,6 +774,7 @@ function Providers() {
             <tr>
               <th scope="col">Profile</th>
               <th scope="col">Endpoint</th>
+              <th scope="col">Models</th>
               <th scope="col">Secret</th>
               <th scope="col">State</th>
               <th scope="col" className="right">
@@ -416,15 +785,31 @@ function Providers() {
           <tbody>
             {providers.map((profile) => {
               const secret = secretNote(profile)
+              const others = profile.models.filter((entry) => entry.model !== profile.model)
               return (
                 <tr key={profile.id}>
                   <th scope="row">
                     <span className="cell-title">{profile.label}</span>
-                    <span className="cell-sub mono">{profile.id}</span>
+                    <span className="cell-sub mono">
+                      {profile.id} · {profile.kind}
+                    </span>
                   </th>
                   <td>
+                    <span className="cell-title mono">{profile.base_url}</span>
+                    <span className="cell-sub">
+                      {profile.supports_tools ? 'tool calling' : 'text only — agents cannot run commands'}
+                    </span>
+                  </td>
+                  <td>
                     <span className="cell-title mono">{profile.model}</span>
-                    <span className="cell-sub mono">{profile.base_url}</span>
+                    <span className="cell-sub">
+                      {others.length === 0
+                        ? 'the only one listed'
+                        : `+ ${others.length} more: ${others
+                            .slice(0, 3)
+                            .map((entry) => entry.model)
+                            .join(', ')}${others.length > 3 ? '…' : ''}`}
+                    </span>
                   </td>
                   <td>
                     <span className={`pill pill-${secret.tone}`}>{secret.text}</span>
@@ -438,7 +823,7 @@ function Providers() {
                     <button
                       type="button"
                       className="button ghost"
-                      onClick={() => setDraft(toDraft(profile))}
+                      onClick={() => open(toDraft(profile))}
                     >
                       Edit
                     </button>
@@ -464,10 +849,20 @@ function Teams() {
   const { data, error, loading, reload } = usePoll(api.teams, 20_000)
   const [name, setName] = useState('')
   const [roles, setRoles] = useState<TeamRole[] | null>(null)
+  const [providers, setProviders] = useState<Provider[]>([])
   const [busy, setBusy] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
 
   const teams = data ?? []
+
+  // A template can pin a role to a provider, so the editor needs the list. Failure is
+  // survivable: the selects fall back to "the job's provider", which is the default.
+  useEffect(() => {
+    void api
+      .providers()
+      .then((loaded) => setProviders(loaded.filter((profile) => profile.enabled)))
+      .catch(() => undefined)
+  }, [])
 
   // Templates are append-only, so "edit" is really "start from this one".
   const duplicate = (team: Team) => {
@@ -612,6 +1007,46 @@ function Teams() {
                     required
                   />
                 </label>
+                <div className="field-row">
+                  <label className="field">
+                    <span>Provider</span>
+                    <select
+                      value={role.provider_id ?? ''}
+                      onChange={(event) =>
+                        patch(index, { provider_id: event.target.value || null, model: null })
+                      }
+                    >
+                      <option value="">The job&apos;s provider</option>
+                      {providers.map((profile) => (
+                        <option key={profile.id} value={profile.id}>
+                          {profile.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>Model</span>
+                    <select
+                      value={role.model ?? ''}
+                      onChange={(event) => patch(index, { model: event.target.value || null })}
+                    >
+                      <option value="">
+                        {role.provider_id ? "That provider's default" : "The job's model"}
+                      </option>
+                      {(
+                        providers.find((profile) => profile.id === role.provider_id)?.models ?? []
+                      ).map((entry) => (
+                        <option key={entry.model} value={entry.model}>
+                          {entry.label ?? entry.model}
+                        </option>
+                      ))}
+                    </select>
+                    <small>
+                      A pin the template carries, so a mixed-model team does not have to be
+                      re-picked on every job. New Job can still override it.
+                    </small>
+                  </label>
+                </div>
               </li>
             ))}
           </ol>
@@ -669,6 +1104,12 @@ function Teams() {
                     {role.name}
                     {role.orchestrator ? ' · orchestrator' : ''}
                   </span>
+                  {role.provider_id || role.model ? (
+                    <span className="role-pin mono">
+                      {role.model ?? role.provider_id}
+                      {role.model && role.provider_id ? ` on ${role.provider_id}` : ''}
+                    </span>
+                  ) : null}
                   <span className="role-instructions">{role.instructions}</span>
                 </li>
               ))}

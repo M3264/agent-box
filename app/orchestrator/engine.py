@@ -40,10 +40,10 @@ from app.orchestrator.providers import (
     Message,
     Provider,
     ProviderError,
-    build_provider,
-    load_profile,
+    ProviderPool,
 )
 from app.orchestrator.roles import Role, Team, load_team
+from app.orchestrator.usage import MeteredProvider, UsageMeter
 
 log = get_logger("agent_hub.engine")
 
@@ -73,6 +73,8 @@ class PhaseRow:
     requires_approval: bool
     output: str | None
     attempts: int
+    #: Which planning round produced this phase. 1 for a job that was never continued.
+    round: int = 1
 
     @classmethod
     def from_row(cls, row: Any) -> PhaseRow:
@@ -87,7 +89,43 @@ class PhaseRow:
             requires_approval=bool(row["requires_approval"]),
             output=row["output"],
             attempts=int(row["attempts"]),
+            round=int(row["round"] if row["round"] is not None else 1),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class Assignment:
+    """Which provider and model one agent should use on one job."""
+
+    provider_id: str | None = None
+    model: str | None = None
+
+    @property
+    def empty(self) -> bool:
+        return self.provider_id is None and self.model is None
+
+
+def resolve_choice(
+    job: Any, role: Role | None, assignment: Assignment
+) -> tuple[str | None, str | None]:
+    """Which provider and model an agent speaks to, most specific source winning.
+
+    Three layers: the job's per-agent assignment, the team template's default for that
+    role, and the job's own provider. The most specific layer that names *anything* wins
+    outright — so an assignment giving only a model keeps the inherited provider, and one
+    naming a provider does not silently carry over a model belonging to a different
+    endpoint.
+
+    Module-level rather than a method because the creation endpoint validates against
+    exactly this precedence, and two copies of it would drift.
+    """
+    layers: list[tuple[str | None, str | None]] = [(assignment.provider_id, assignment.model)]
+    if role is not None:
+        layers.append((role.provider_id, role.model))
+    for provider_id, model in layers:
+        if provider_id or model:
+            return provider_id or job["provider_id"], model
+    return job["provider_id"], None
 
 
 class JobEngine:
@@ -266,21 +304,25 @@ class JobEngine:
             job_id, "agent_state", {"status": status, "current_action": action}, source=agent
         )
 
-    async def _emit_phase(self, job_id: str, phase: PhaseRow, status: str) -> None:
-        await self.store.record(
-            job_id,
-            "phase",
-            {
-                "phase_id": phase.id,
-                "seq": phase.seq,
-                "kind": phase.kind,
-                "name": phase.name,
-                "owner": phase.owner,
-                "status": status,
-                "acceptance": phase.acceptance,
-            },
-            source=phase.owner,
-        )
+    async def _emit_phase(
+        self, job_id: str, phase: PhaseRow, status: str, provider: Provider | None = None
+    ) -> None:
+        payload: dict[str, Any] = {
+            "phase_id": phase.id,
+            "seq": phase.seq,
+            "kind": phase.kind,
+            "name": phase.name,
+            "owner": phase.owner,
+            "status": status,
+            "acceptance": phase.acceptance,
+            "round": phase.round,
+        }
+        if provider is not None:
+            # Which model actually ran this phase. Worth saying out loud now that two
+            # phases of one job can be answered by different endpoints.
+            payload["provider_id"] = provider.id
+            payload["model"] = provider.model
+        await self.store.record(job_id, "phase", payload, source=phase.owner)
 
     async def _next_phase(self, job_id: str) -> PhaseRow | None:
         row = await self.db.fetch_one(
@@ -347,7 +389,7 @@ class JobEngine:
                 return
 
             team = await load_team(self.db, int(job["team_id"]))
-            profile = await load_profile(self.db, job["provider_id"])
+            assignments = await self._load_assignments(job_id)
             # Resolved once, here, and deliberately before the first phase runs. If the
             # job asked for a backend this host cannot provide, it must fail with that
             # message rather than run a single command somewhere the operator did not
@@ -356,12 +398,20 @@ class JobEngine:
 
             await self._set_job_status(job_id, "running")
             for role in team.roles:
-                if not await self.db.exists(
-                    "select 1 from job_agents where job_id=? and agent=?", (job_id, role.id)
-                ):
+                current = await self.db.fetch_value(
+                    "select status from job_agents where job_id=? and agent=?", (job_id, role.id)
+                )
+                # 'complete' and 'stopped' mean the previous round finished. A continued
+                # job is the same job, so its agents go back to queued rather than
+                # sitting on last round's terminal state while they work.
+                if current is None or current in {"complete", "stopped"}:
                     await self._set_agent(job_id, role.id, "queued", "Queued")
 
-            async with build_provider(profile) as provider:  # type: ignore[union-attr]
+            meter = UsageMeter(db=self.db, job_id=job_id)
+            # One pool per job rather than one provider: each agent may name its own
+            # provider and model, and the pool builds each distinct pair once over a
+            # single shared HTTP client.
+            async with ProviderPool(self.db, default_provider_id=job["provider_id"]) as pool:
                 previous_owner: str | None = None
                 while True:
                     await self._await_unpaused(job_id, cancel)
@@ -383,7 +433,9 @@ class JobEngine:
                             },
                             source=previous_owner,
                         )
-                    await self._run_phase(job, team, provider, phase, cancel, box)
+                    await self._run_phase(
+                        job, team, pool, meter, assignments, phase, cancel, box
+                    )
                     previous_owner = phase.owner
 
             await self._finish(job_id, team)
@@ -491,11 +543,51 @@ class JobEngine:
 
     # ---------------------------------------------------------------- phase exec
 
+    async def _load_assignments(self, job_id: str) -> dict[str, Assignment]:
+        """Per-agent provider choices, read once per run.
+
+        Read here rather than per phase so a job runs on the assignments it was created
+        with, even if the operator edits something mid-run — the same reasoning as
+        recording the resolved sandbox on the row.
+        """
+        rows = await self.db.fetch_all(
+            "select agent,provider_id,model from job_agent_providers where job_id=?", (job_id,)
+        )
+        return {
+            row["agent"]: Assignment(provider_id=row["provider_id"], model=row["model"])
+            for row in rows
+        }
+
+    @staticmethod
+    def _resolve_choice(
+        job: Any, role: Role | None, assignment: Assignment
+    ) -> tuple[str | None, str | None]:
+        return resolve_choice(job, role, assignment)
+
+    async def _provider_for(
+        self,
+        pool: ProviderPool,
+        meter: UsageMeter,
+        job: Any,
+        role: Role | None,
+        assignments: dict[str, Assignment],
+        phase: PhaseRow,
+        purpose: str,
+    ) -> Provider:
+        agent = role.id if role is not None else phase.owner
+        provider_id, model = self._resolve_choice(
+            job, role, assignments.get(agent, Assignment())
+        )
+        inner = await pool.get(provider_id, model)
+        return MeteredProvider(inner, meter, phase_id=phase.id, agent=agent, purpose=purpose)
+
     async def _run_phase(
         self,
         job: Any,
         team: Team,
-        provider: Provider,
+        pool: ProviderPool,
+        meter: UsageMeter,
+        assignments: dict[str, Assignment],
         phase: PhaseRow,
         cancel: asyncio.Event,
         box: sandbox_mod._Sandbox | None = None,
@@ -506,12 +598,20 @@ class JobEngine:
         if phase.requires_approval and not await self._gate(job, phase, cancel):
             return  # rejected by the operator; phase is now terminal
 
+        purpose = phase.kind if phase.kind in {"plan", "synthesis"} else "work"
+        # Resolving the provider before the phase is marked active means a bad
+        # assignment fails the phase with a clear reason instead of leaving a phase
+        # 'active' against a provider that does not exist.
+        provider = await self._provider_for(
+            pool, meter, job, role, assignments, phase, purpose
+        )
+
         await self.db.execute(
             "update phases set status='active',attempts=attempts+1,"
             "started_at=coalesce(started_at,unixepoch('subsec')) where id=?",
             (phase.id,),
         )
-        await self._emit_phase(job_id, phase, "active")
+        await self._emit_phase(job_id, phase, "active", provider=provider)
         await self._set_agent(job_id, role.id, "active", phase.name)
 
         guidance = await self._drain_operator_messages(job_id)
@@ -674,9 +774,22 @@ class JobEngine:
             if guidance
             else ""
         )
+        # A plan phase at seq 0 is the job's first. Anything later is a follow-up round
+        # on a job that already ran, and planning it without what the earlier rounds
+        # produced would plan the same work twice — the operator's follow-up almost
+        # always refers to that output.
+        history = ""
+        if phase.seq > 0:
+            prior = self._context_block(await self._prior_outputs(job_id, phase.seq))
+            history = (
+                f"\n\nThis is a follow-up round on work that is already done. "
+                f"What the team produced so far:\n{prior}\n\n"
+                "Plan only what the operator is now asking for. Do not re-plan work "
+                "above unless it needs redoing, and say so if it does."
+            )
         prompt = (
             f"Task:\n{job['task']}\n\n"
-            f"Available specialists:\n{roster}{guidance_block}\n\n"
+            f"Available specialists:\n{roster}{guidance_block}{history}\n\n"
             f"Produce an ordered plan of between 1 and {MAX_PLANNED_PHASES} phases. "
             "Each phase needs exactly one owner from the specialist ids above, and "
             "acceptance criteria that can be objectively checked. Set requires_approval "
@@ -721,11 +834,11 @@ class JobEngine:
                 source="system",
             )
 
-        await self._insert_phases(job_id, planned, team)
+        await self._insert_phases(job_id, planned, team, round=phase.round)
         await self.store.record(
             job_id,
             "plan",
-            {"phases": planned, "notes": notes},
+            {"phases": planned, "notes": notes, "round": phase.round},
             source=team.orchestrator.id,
         )
         # Back to 'running' now the plan exists, so the status reflects the work
@@ -763,10 +876,16 @@ class JobEngine:
             raise ValueError("plan contained no usable phases")
         return cleaned
 
-    async def _insert_phases(self, job_id: str, planned: list[dict[str, Any]], team: Team) -> None:
+    async def _insert_phases(
+        self, job_id: str, planned: list[dict[str, Any]], team: Team, round: int = 1
+    ) -> None:
         """Write the planned phases plus a final synthesis phase.
 
         Synthesis is a phase like any other so that it, too, survives a restart.
+
+        Appending from ``max(seq)`` rather than from zero is what makes a follow-up
+        round work: the earlier rounds' phases stay exactly where they are, terminal and
+        readable, and the new ones queue up behind them.
         """
         async with self.db.transaction() as conn:
             async with conn.execute(
@@ -777,7 +896,8 @@ class JobEngine:
             for offset, item in enumerate(planned, start=1):
                 await conn.execute(
                     "insert into phases(job_id,seq,kind,name,owner,acceptance,depends_on,status,"
-                    "requires_approval,created_at) values(?,?,?,?,?,?,?,'pending',?,unixepoch('subsec'))",
+                    "requires_approval,round,created_at)"
+                    " values(?,?,?,?,?,?,?,'pending',?,?,unixepoch('subsec'))",
                     (
                         job_id,
                         start + offset,
@@ -787,13 +907,15 @@ class JobEngine:
                         item["acceptance"],
                         json.dumps([previous] if previous else []),
                         int(item["requires_approval"]),
+                        round,
                     ),
                 )
                 previous = item["owner"]
 
             await conn.execute(
                 "insert into phases(job_id,seq,kind,name,owner,acceptance,depends_on,status,"
-                "requires_approval,created_at) values(?,?,?,?,?,?,?,'pending',0,unixepoch('subsec'))",
+                "requires_approval,round,created_at)"
+                " values(?,?,?,?,?,?,?,'pending',0,?,unixepoch('subsec'))",
                 (
                     job_id,
                     start + len(planned) + 1,
@@ -802,6 +924,7 @@ class JobEngine:
                     team.orchestrator.id,
                     "A single coherent answer covering decisions, caveats and next actions.",
                     json.dumps([previous] if previous else []),
+                    round,
                 ),
             )
 
@@ -951,8 +1074,20 @@ class JobEngine:
     # --------------------------------------------------------------------- finish
 
     async def _finish(self, job_id: str, team: Team) -> None:
+        # Scoped to the current round, not the job. A job that failed a phase in round 1
+        # and was then continued with a follow-up that succeeded should report the
+        # outcome of what it just did — otherwise one early failure would make every
+        # later round read as an error forever, and "continue" would be pointless.
+        current = int(
+            await self.db.fetch_value(
+                "select coalesce(max(round),1) from phases where job_id=?", (job_id,), default=1
+            )
+            or 1
+        )
         failed = await self.db.fetch_value(
-            "select count(*) from phases where job_id=? and status='failed'", (job_id,), default=0
+            "select count(*) from phases where job_id=? and round=? and status='failed'",
+            (job_id, current),
+            default=0,
         )
         status = "error" if failed else "complete"
         if status == "error":

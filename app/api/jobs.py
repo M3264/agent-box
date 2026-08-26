@@ -13,9 +13,19 @@ from fastapi.responses import StreamingResponse
 from app.config import settings
 from app.deps import db, engine, events, require_job
 from app.logging_setup import get_logger
-from app.models import JobAction, JobCreate, MessageCreate
-from app.orchestrator.roles import load_team, resolve_team_id
+from app.models import (
+    TERMINAL_JOB_STATUSES,
+    AgentAssignment,
+    JobAction,
+    JobContinue,
+    JobCreate,
+    JobRerun,
+    MessageCreate,
+)
+from app.orchestrator.engine import Assignment, resolve_choice
+from app.orchestrator.roles import Team, load_team, resolve_team_id
 from app.orchestrator.sandbox import status as sandbox_status
+from app.orchestrator.usage import job_usage
 from app.streams import job_event_stream
 
 log = get_logger("agent_hub.api.jobs")
@@ -81,24 +91,108 @@ async def _action(job_id: str) -> JobAction:
     return JobAction(id=job_id, status=row["status"], paused=bool(row["paused"]))
 
 
-@router.post("", status_code=201)
-async def create_job(payload: JobCreate) -> dict[str, Any]:
-    """Create a job and start it.
-
-    Only the ``seq 0`` planning phase is seeded — the manager authors the rest. v1
-    pre-inserted one phase per hardcoded role here and never updated them, which is
-    why every job's plan showed five permanently-queued phases.
-    """
-    job_id = uuid.uuid4().hex[:12]
-    team_id = await resolve_team_id(db, payload.team_id)
-    team = await load_team(db, team_id)
-
-    if payload.provider_id and not await db.exists(
-        "select 1 from provider_profiles where id=? and enabled=1", (payload.provider_id,)
+async def _check_provider(provider_id: str | None, *, where: str) -> None:
+    if provider_id and not await db.exists(
+        "select 1 from provider_profiles where id=? and enabled=1", (provider_id,)
     ):
         raise HTTPException(
-            status_code=400, detail=f"provider '{payload.provider_id}' not found or disabled"
+            status_code=400, detail=f"provider '{provider_id}' ({where}) not found or disabled"
         )
+
+
+async def _validate_assignments(
+    team: Team, job_provider_id: str | None, agents: list[AgentAssignment]
+) -> None:
+    """Reject per-agent choices that could not work, before the job exists.
+
+    Checked here as well as being resolved in the engine, for the same reason the
+    sandbox is: the engine's refusal is the real guarantee, but a 400 at creation says
+    which agent and which model, instead of handing back a job that dies partway
+    through on its third phase.
+    """
+    known = set(team.role_ids)
+    for entry in agents:
+        if entry.agent not in known:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{entry.agent}' is not a role in team '{team.name}'"
+                f" (roles: {', '.join(sorted(known))})",
+            )
+        await _check_provider(entry.provider_id, where=f"for agent '{entry.agent}'")
+
+        # Resolved through exactly the precedence the engine will use, so a model given
+        # without a provider is checked against the provider it will actually reach.
+        provider_id, model = resolve_choice(
+            {"provider_id": job_provider_id},
+            team.get(entry.agent),
+            Assignment(provider_id=entry.provider_id, model=entry.model),
+        )
+        if not model:
+            continue
+        if provider_id is None:
+            # The job named no provider, so it will run on whichever profile is the
+            # server default. Checking against that default now is worth doing even
+            # though it could change before the job starts: it is the common case, and
+            # skipping it would leave the check firing only for operators who pin a
+            # provider explicitly. The engine's own refusal remains the guarantee.
+            provider_id = await db.fetch_value(
+                "select id from provider_profiles where enabled=1 order by rowid limit 1"
+            )
+        if not provider_id:
+            continue
+        listed = [
+            row["model"]
+            for row in await db.fetch_all(
+                "select model from provider_models where provider_id=? order by model",
+                (provider_id,),
+            )
+        ]
+        # An empty list means the profile predates model lists entirely; refusing every
+        # model there would be worse than letting the endpoint answer.
+        if listed and model not in listed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{model}' is not a model on provider '{provider_id}'"
+                f" (available: {', '.join(listed)})",
+            )
+
+
+async def _write_assignments(conn: Any, job_id: str, agents: list[AgentAssignment]) -> None:
+    for entry in agents:
+        if entry.provider_id is None and entry.model is None:
+            # Nothing pinned is the same as no row, and a row of nulls would make the
+            # UI show an override that changes nothing.
+            continue
+        await conn.execute(
+            "insert into job_agent_providers(job_id,agent,provider_id,model) values(?,?,?,?)"
+            " on conflict(job_id,agent) do update set"
+            "  provider_id=excluded.provider_id,model=excluded.model",
+            (job_id, entry.agent, entry.provider_id, entry.model),
+        )
+
+
+async def _spawn_job(
+    *,
+    task: str,
+    team_id: int | None,
+    mode: str,
+    provider_id: str | None,
+    sandbox: str | None,
+    agents: list[AgentAssignment],
+    forked_from: str | None = None,
+) -> dict[str, Any]:
+    """Create a job, seed its planning phase, and start it.
+
+    Only the ``seq 0`` planning phase is seeded — the manager authors the rest. v1
+    pre-inserted one phase per hardcoded role here and never updated them, which is why
+    every job's plan showed five permanently-queued phases.
+    """
+    job_id = uuid.uuid4().hex[:12]
+    resolved_team = await resolve_team_id(db, team_id)
+    team = await load_team(db, resolved_team)
+
+    await _check_provider(provider_id, where="for the job")
+    await _validate_assignments(team, provider_id, agents)
 
     workspace = settings.workspace_root / job_id
     workspace.mkdir(parents=True, exist_ok=True)
@@ -108,32 +202,33 @@ async def create_job(payload: JobCreate) -> dict[str, Any]:
     # tells the operator *why* instead of handing them a job that dies on its first
     # phase. `None` is not checked: it resolves to the server default when the job
     # starts, which may be different by then.
-    if payload.sandbox is not None:
-        state = sandbox_status().get(payload.sandbox)
+    if sandbox is not None:
+        state = sandbox_status().get(sandbox)
         if state is not None and not state.available:
             raise HTTPException(
                 status_code=400,
-                detail=f"the '{payload.sandbox}' sandbox is not available on this host: {state.reason}",
+                detail=f"the '{sandbox}' sandbox is not available on this host: {state.reason}",
             )
 
     async with db.transaction() as conn:
         await conn.execute(
             "insert into jobs(id,task,team_id,provider_id,mode,status,paused,workspace,"
-            "sandbox,created_at,updated_at)"
-            " values(?,?,?,?,?,'queued',0,?,?,unixepoch('subsec'),unixepoch('subsec'))",
+            "sandbox,forked_from,rounds,created_at,updated_at)"
+            " values(?,?,?,?,?,'queued',0,?,?,?,1,unixepoch('subsec'),unixepoch('subsec'))",
             (
                 job_id,
-                payload.task,
-                team_id,
-                payload.provider_id,
-                payload.mode,
+                task,
+                resolved_team,
+                provider_id,
+                mode,
                 str(workspace),
-                payload.sandbox,
+                sandbox,
+                forked_from,
             ),
         )
         await conn.execute(
-            "insert into phases(job_id,seq,kind,name,owner,acceptance,status,created_at)"
-            " values(?,0,'plan',?,?,?,'pending',unixepoch('subsec'))",
+            "insert into phases(job_id,seq,kind,name,owner,acceptance,status,round,created_at)"
+            " values(?,0,'plan',?,?,?,'pending',1,unixepoch('subsec'))",
             (
                 job_id,
                 "Plan the work",
@@ -141,17 +236,41 @@ async def create_job(payload: JobCreate) -> dict[str, Any]:
                 "An ordered set of phases, each with one owner and checkable acceptance criteria.",
             ),
         )
+        await _write_assignments(conn, job_id, agents)
 
     await events.record(job_id, "status", {"status": "queued"}, source="system")
     engine.start(job_id)
-    log.info("job created", extra={"job_id": job_id, "mode": payload.mode, "team_id": team_id})
+    log.info(
+        "job created",
+        extra={
+            "job_id": job_id,
+            "mode": mode,
+            "team_id": resolved_team,
+            "assigned_agents": len(agents),
+            "forked_from": forked_from,
+        },
+    )
     return {
         "id": job_id,
         "status": "queued",
-        "mode": payload.mode,
-        "team_id": team_id,
-        "sandbox": payload.sandbox,
+        "mode": mode,
+        "team_id": resolved_team,
+        "sandbox": sandbox,
+        "provider_id": provider_id,
+        "forked_from": forked_from,
     }
+
+
+@router.post("", status_code=201)
+async def create_job(payload: JobCreate) -> dict[str, Any]:
+    return await _spawn_job(
+        task=payload.task,
+        team_id=payload.team_id,
+        mode=payload.mode,
+        provider_id=payload.provider_id,
+        sandbox=payload.sandbox,
+        agents=payload.agents,
+    )
 
 
 @router.get("")
@@ -187,19 +306,27 @@ async def get_job(job_id: JobId) -> dict[str, Any]:
     """
     job = _job_dict(await require_job(job_id))
 
-    phases, agents, artifacts, messages, gates, calls, history = await asyncio.gather(
-        db.fetch_all("select * from phases where job_id=? order by seq", (job_id,)),
-        db.fetch_all("select * from job_agents where job_id=? order by agent", (job_id,)),
-        db.fetch_all(
-            f"select {ARTIFACT_COLUMNS} from artifacts where job_id=? order by id", (job_id,)
-        ),
-        db.fetch_all("select * from job_messages where job_id=? order by id", (job_id,)),
-        db.fetch_all("select * from approvals where job_id=? order by created_at", (job_id,)),
-        db.fetch_all(
-            f"select {TOOL_CALL_COLUMNS} from tool_calls where job_id=? order by created_at,rowid",
-            (job_id,),
-        ),
-        events.history(job_id, after=0, limit=2000),
+    phases, agents, artifacts, messages, gates, calls, history, usage, pinned = (
+        await asyncio.gather(
+            db.fetch_all("select * from phases where job_id=? order by seq", (job_id,)),
+            db.fetch_all("select * from job_agents where job_id=? order by agent", (job_id,)),
+            db.fetch_all(
+                f"select {ARTIFACT_COLUMNS} from artifacts where job_id=? order by id", (job_id,)
+            ),
+            db.fetch_all("select * from job_messages where job_id=? order by id", (job_id,)),
+            db.fetch_all("select * from approvals where job_id=? order by created_at", (job_id,)),
+            db.fetch_all(
+                f"select {TOOL_CALL_COLUMNS} from tool_calls where job_id=? order by created_at,rowid",
+                (job_id,),
+            ),
+            events.history(job_id, after=0, limit=2000),
+            job_usage(db, job_id),
+            db.fetch_all(
+                "select agent,provider_id,model from job_agent_providers where job_id=?"
+                " order by agent",
+                (job_id,),
+            ),
+        )
     )
 
     return {
@@ -211,6 +338,12 @@ async def get_job(job_id: JobId) -> dict[str, Any]:
         "approvals": [dict(row) for row in gates],
         "tool_calls": [_tool_call_dict(row) for row in calls],
         "events": [event.to_dict() for event in history],
+        "usage": usage,
+        "agent_providers": [dict(row) for row in pinned],
+        # A finished job is not a closed one: the operator can add a round to it or
+        # start a fresh job from it, and the UI needs to know which without guessing
+        # from the status string.
+        "can_continue": job["status"] in TERMINAL_JOB_STATUSES,
         "cursor": history[-1].id if history else 0,
     }
 
@@ -325,8 +458,15 @@ async def post_message(job_id: JobId, payload: MessageCreate) -> dict[str, Any]:
     ``consumed_at`` is how the UI shows whether the team has picked it up yet.
     """
     job = await require_job(job_id)
-    if job["status"] in {"complete", "error", "stopped"}:
-        raise HTTPException(status_code=409, detail=f"job is {job['status']}; nothing will read this")
+    if job["status"] in TERMINAL_JOB_STATUSES:
+        # Not a dead end: the conversation stays open, but a message dropped into a
+        # finished job would sit unconsumed forever, so the operator is pointed at the
+        # endpoint that actually does something with it. Spending a round of tokens is
+        # a decision, not a side effect of typing.
+        raise HTTPException(
+            status_code=409,
+            detail=f"job is {job['status']}; POST /api/jobs/{job_id}/continue to work on it further",
+        )
 
     message_id = await db.insert(
         "insert into job_messages(job_id,agent,role,content,created_at)"
@@ -347,6 +487,144 @@ async def post_message(job_id: JobId, payload: MessageCreate) -> dict[str, Any]:
         "content": payload.content,
         "consumed_at": None,
     }
+
+
+# --------------------------------------------------------------------- continuation
+
+
+@router.post("/{job_id}/continue", status_code=202)
+async def continue_job(job_id: JobId, payload: JobContinue) -> dict[str, Any]:
+    """Add a round of work to a job that has already finished.
+
+    The same job continues rather than a copy being made: the earlier rounds' phases
+    stay exactly where they are — terminal, with their output readable — and a new
+    planning phase is appended behind them. The planner is given both the operator's
+    instruction and what the team already produced, so a follow-up can say "now also
+    check the login flow" without restating the original task.
+
+    Why append instead of reopening the last phase: a completed phase's output is
+    committed and other phases have read it. Rewriting it would make the transcript
+    disagree with what actually happened, which is the one thing the durability rule
+    exists to prevent.
+    """
+    job = await require_job(job_id)
+    if job["status"] not in TERMINAL_JOB_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"job is {job['status']}; send guidance to /messages instead",
+        )
+    if engine.is_running(job_id):  # pragma: no cover - terminal jobs have no task
+        raise HTTPException(status_code=409, detail="job is still winding down; try again")
+
+    team = await load_team(db, int(job["team_id"]))
+    round_number = int(job["rounds"] or 1) + 1
+
+    async with db.transaction() as conn:
+        await conn.execute(
+            "insert into job_messages(job_id,agent,role,content,created_at)"
+            " values(?,?,'operator',?,unixepoch('subsec'))",
+            (job_id, team.orchestrator.id, payload.instruction),
+        )
+        async with conn.execute(
+            "select coalesce(max(seq),0) from phases where job_id=?", (job_id,)
+        ) as cursor:
+            next_seq = int((await cursor.fetchone())[0]) + 1
+        await conn.execute(
+            "insert into phases(job_id,seq,kind,name,owner,acceptance,status,round,created_at)"
+            " values(?,?,'plan',?,?,?,'pending',?,unixepoch('subsec'))",
+            (
+                job_id,
+                next_seq,
+                f"Plan round {round_number}",
+                team.orchestrator.id,
+                "A plan for the follow-up only, building on the work already done.",
+                round_number,
+            ),
+        )
+        # `error` is cleared because it described the round that has ended. Leaving it
+        # set would make a successful follow-up render as a failed job.
+        await conn.execute(
+            "update jobs set status='queued',paused=0,error=null,rounds=?,"
+            "updated_at=unixepoch('subsec') where id=?",
+            (round_number, job_id),
+        )
+
+    await events.record(
+        job_id,
+        "notice",
+        {
+            "message": f"Round {round_number} requested by the operator.",
+            "instruction": payload.instruction,
+            "round": round_number,
+        },
+        source="operator",
+    )
+    await events.record(job_id, "status", {"status": "queued"}, source="system")
+    engine.start(job_id)
+    log.info("job continued", extra={"job_id": job_id, "round": round_number})
+    return {"id": job_id, "status": "queued", "round": round_number}
+
+
+@router.post("/{job_id}/rerun", status_code=201)
+async def rerun_job(job_id: JobId, payload: JobRerun) -> dict[str, Any]:
+    """Start a fresh job seeded from this one.
+
+    For "do that again, but…" — the team, mode, sandbox, provider and every per-agent
+    assignment carry over, so only the part that changes has to be sent. A new job
+    rather than a new round because the workspace starts clean and the original stays
+    exactly as it was; ``forked_from`` keeps the pair traceable.
+
+    Allowed on a running job as well as a finished one: comparing two settings side by
+    side is a reasonable thing to want, and nothing about the original is touched.
+    """
+    job = await require_job(job_id)
+
+    if payload.agents is not None:
+        agents = list(payload.agents)
+    else:
+        agents = [
+            AgentAssignment(
+                agent=row["agent"], provider_id=row["provider_id"], model=row["model"]
+            )
+            for row in await db.fetch_all(
+                "select agent,provider_id,model from job_agent_providers where job_id=?"
+                " order by agent",
+                (job_id,),
+            )
+        ]
+
+    created = await _spawn_job(
+        task=payload.task or job["task"],
+        team_id=payload.team_id if payload.team_id is not None else int(job["team_id"]),
+        mode=payload.mode or job["mode"],
+        # Absent means inherit; an explicit null means "no provider, use the server
+        # default". `is not None` alone cannot say the second one, and a re-run form
+        # that shows the inherited provider has to be able to clear it.
+        provider_id=(
+            payload.provider_id if "provider_id" in payload.model_fields_set else job["provider_id"]
+        ),
+        sandbox=payload.sandbox if "sandbox" in payload.model_fields_set else job["sandbox"],
+        agents=agents,
+        forked_from=job_id,
+    )
+    # Recorded on the original too, so its transcript says where the follow-up went.
+    await events.record(
+        job_id, "notice", {"message": f"Re-run as job {created['id']}.", "job_id": created["id"]},
+        source="operator",
+    )
+    return created
+
+
+@router.get("/{job_id}/usage")
+async def get_usage(job_id: JobId) -> dict[str, Any]:
+    """What this job has spent, in total and broken down by agent and model.
+
+    Every provider response already carried these numbers and every one of them was
+    discarded, so a job that cost four million tokens looked exactly like one that cost
+    four thousand.
+    """
+    await require_job(job_id)
+    return await job_usage(db, job_id)
 
 
 # ------------------------------------------------------------------------ control

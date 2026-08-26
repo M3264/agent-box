@@ -31,6 +31,18 @@ function matches(job: JobSummary, filter: Filter): boolean {
   }
 }
 
+/**
+ * Short form for token counts, because these get long fast.
+ *
+ * Rounded rather than truncated: a job that spent 1.96M reading as `1.9M` looks like
+ * a different order of decision than `2.0M`.
+ */
+function compact(count: number): string {
+  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(count >= 10_000_000 ? 0 : 1)}M`
+  if (count >= 10_000) return `${Math.round(count / 1000)}k`
+  return count.toLocaleString()
+}
+
 export function JobsScreen() {
   const { data, error, loading } = usePoll(() => api.jobs(), 4000)
   const [filter, setFilter] = useState<Filter>('all')
@@ -42,6 +54,7 @@ export function JobsScreen() {
       live: jobs.filter((job) => matches(job, 'live')).length,
       attention: jobs.filter((job) => matches(job, 'attention')).length,
       done: jobs.filter((job) => matches(job, 'done')).length,
+      tokens: jobs.reduce((sum, job) => sum + job.total_tokens, 0),
     }),
     [jobs],
   )
@@ -81,6 +94,12 @@ export function JobsScreen() {
           <span className="card-value">{counts.done}</span>
           <span className="card-label">Finished</span>
         </button>
+        <div className="card card-static">
+          <span className="card-value">{compact(counts.tokens)}</span>
+          <span className="card-label">
+            Tokens across {jobs.length} job{jobs.length === 1 ? '' : 's'}
+          </span>
+        </div>
       </div>
 
       <div className="toolbar">
@@ -126,6 +145,18 @@ export function JobsScreen() {
                         <span>{job.provider_id}</span>
                       </>
                     ) : null}
+                    {job.rounds > 1 ? (
+                      <>
+                        <span>·</span>
+                        <span>{job.rounds} rounds</span>
+                      </>
+                    ) : null}
+                    {job.forked_from ? (
+                      <>
+                        <span>·</span>
+                        <span>re-run of {job.forked_from.slice(0, 8)}</span>
+                      </>
+                    ) : null}
                   </p>
                 </div>
 
@@ -139,6 +170,14 @@ export function JobsScreen() {
                 </div>
 
                 <div className="job-flags">
+                  {job.total_tokens > 0 ? (
+                    <span
+                      className="pill pill-idle"
+                      title={`${job.prompt_tokens.toLocaleString()} in · ${job.completion_tokens.toLocaleString()} out · ${job.provider_calls} calls`}
+                    >
+                      {compact(job.total_tokens)} tok
+                    </span>
+                  ) : null}
                   {job.pending_approvals > 0 ? (
                     <span className="pill pill-warn">
                       {job.pending_approvals} to approve

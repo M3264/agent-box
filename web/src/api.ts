@@ -8,17 +8,22 @@
  */
 
 import type {
+  AgentProvider,
   Approval,
   ApprovalStatus,
+  DiscoveredModels,
   Health,
   InboxApproval,
   JobAction,
   JobMessage,
   JobSnapshot,
   JobSummary,
+  JobUsage,
   Mode,
   Phase,
   Provider,
+  ProviderKind,
+  ProviderTemplate,
   SandboxInfo,
   SandboxKind,
   Team,
@@ -102,12 +107,34 @@ export const api = {
     team_id?: number
     provider_id?: string | null
     sandbox?: SandboxKind | null
+    /** Per-agent overrides. Omitted agents use the job's provider. */
+    agents?: AgentProvider[]
   }) => request<{ id: string }>('/api/jobs', body(payload)),
 
   plan: (id: string) => request<Phase[]>(`/api/jobs/${id}/plan`),
   messages: (id: string) => request<JobMessage[]>(`/api/jobs/${id}/messages`),
   sendMessage: (id: string, content: string) =>
     request<JobMessage>(`/api/jobs/${id}/messages`, body({ content })),
+
+  usage: (id: string) => request<JobUsage>(`/api/jobs/${id}/usage`),
+  /** Another round on the same job: the conversation continues where it stopped. */
+  continueJob: (id: string, instruction: string) =>
+    request<{ id: string; status: string; round: number }>(
+      `/api/jobs/${id}/continue`,
+      body({ instruction }),
+    ),
+  /** A fresh job seeded from this one — settings inherited, workspace clean. */
+  rerunJob: (
+    id: string,
+    payload: {
+      task?: string
+      team_id?: number
+      mode?: Mode
+      provider_id?: string | null
+      sandbox?: SandboxKind | null
+      agents?: AgentProvider[]
+    } = {},
+  ) => request<{ id: string; forked_from: string }>(`/api/jobs/${id}/rerun`, body(payload)),
 
   toolCalls: (id: string, phaseId?: number) =>
     request<ToolCall[]>(
@@ -128,11 +155,16 @@ export const api = {
     ),
 
   providers: () => request<Provider[]>('/api/providers'),
+  providerKinds: () => request<ProviderKind[]>('/api/provider-kinds'),
+  providerTemplates: () => request<ProviderTemplate[]>('/api/provider-templates'),
   saveProvider: (profile: Omit<Provider, 'secret_ok' | 'created_at'>) =>
     request<Provider>(`/api/providers/${profile.id}`, {
       method: 'PUT',
       body: JSON.stringify(profile),
     }),
+  /** Ask the endpoint what it serves. Saves nothing; the operator picks. */
+  discoverModels: (id: string) =>
+    request<DiscoveredModels>(`/api/providers/${id}/models/discover`, { method: 'POST' }),
   deleteProvider: (id: string) =>
     request<{ deleted: boolean; disabled: boolean; jobs: number }>(`/api/providers/${id}`, {
       method: 'DELETE',

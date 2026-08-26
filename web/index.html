@@ -3,9 +3,22 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="color-scheme" content="dark light" />
-    <meta name="theme-color" content="#0b0e14" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0a0a0b" />
     <title>Agent Hub</title>
+    <!--
+      Three typefaces, three jobs: Instrument Serif for headings (the editorial
+      voice), Archivo for prose and controls, IBM Plex Mono for figures and
+      identifiers (the telemetry voice). Loaded with `display=swap` behind a real
+      fallback stack, so a host with no route to Google renders in system faces
+      rather than showing nothing.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap"
+    />
   </head>
   <body>
     <div id="root"></div>

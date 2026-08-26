@@ -104,6 +104,15 @@ export interface JobSummary {
   phase_total: number
   phase_complete: number
   artifact_count: number
+  /** Running totals, written as each provider call returns. */
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  provider_calls: number
+  /** How many rounds of work the operator has asked for. 1 for most jobs. */
+  rounds: number
+  /** The job this one was re-run from, if any. */
+  forked_from: string | null
 }
 
 export interface Phase {
@@ -122,6 +131,11 @@ export interface Phase {
   attempts: number
   started_at: number | null
   finished_at: number | null
+  /** Which round of the conversation produced this phase. */
+  round: number
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
 }
 
 export interface Agent {
@@ -187,6 +201,37 @@ export interface JobEvent {
   payload: Record<string, unknown>
 }
 
+/** What a job spent, in total and broken down. */
+export interface JobUsage {
+  totals: { prompt: number; completion: number; total: number; calls: number }
+  by_agent: { agent: string | null; calls: number; prompt: number; completion: number; total: number }[]
+  by_model: { provider_id: string | null; model: string | null; calls: number; total: number }[]
+}
+
+/** One agent's pinned provider and model for a job. */
+export interface AgentProvider {
+  agent: string
+  provider_id: string | null
+  model: string | null
+}
+
+/**
+ * Everything New Job needs to open prefilled from an existing job.
+ *
+ * `from` is the job id rather than a copy of its settings, because the re-run posts
+ * to `/rerun` so the server records `forked_from` and inherits anything the operator
+ * did not change.
+ */
+export interface JobSeed {
+  from: string
+  task: string
+  mode: Mode
+  team_id: number
+  provider_id: string | null
+  sandbox: SandboxKind | null
+  agents: AgentProvider[]
+}
+
 export interface JobSnapshot extends Omit<JobSummary, 'pending_approvals' | 'phase_total' | 'phase_complete' | 'artifact_count'> {
   workspace: string | null
   /** Which confinement this job actually ran under; null when tools are off. */
@@ -200,6 +245,10 @@ export interface JobSnapshot extends Omit<JobSummary, 'pending_approvals' | 'pha
   tool_calls: ToolCall[]
   events: JobEvent[]
   cursor: number
+  usage: JobUsage
+  agent_providers: AgentProvider[]
+  /** True once the job is terminal: the conversation can take another round. */
+  can_continue: boolean
 }
 
 export interface JobAction {
@@ -208,19 +257,62 @@ export interface JobAction {
   paused: boolean
 }
 
+/** One model an endpoint serves. */
+export interface ProviderModel {
+  model: string
+  label: string | null
+  supports_tools: boolean
+}
+
+/**
+ * A wire protocol this build can speak. There is one adapter class per kind, so the
+ * list is short and only changes with a deploy — which is why the form asks rather
+ * than guessing.
+ */
+export interface ProviderKind {
+  id: string
+  label: string
+  detail: string
+  auth: string
+  models_path: string | null
+  supports_tools: boolean
+}
+
+/** A codeless vendor preset that fills in a new profile. */
+export interface ProviderTemplate {
+  id: string
+  label: string
+  kind: string
+  base_url: string
+  secret_ref: string | null
+  models: string[]
+  headers: Record<string, string>
+}
+
 export interface Provider {
   id: string
   label: string
   kind: string
   base_url: string
+  /** The default model — what a job gets when it names none. One of `models`. */
   model: string
+  /** Everything this endpoint serves. A provider is not one model. */
+  models: ProviderModel[]
   /** A reference to a secret, never the secret itself. */
   secret_ref: string | null
   headers: Record<string, string>
   enabled: boolean
+  supports_tools: boolean
   /** Whether `secret_ref` resolves server-side; null when none is needed. */
   secret_ok: boolean | null
   created_at: number
+}
+
+/** What discovery found on an endpoint. Nothing is saved until the operator says so. */
+export interface DiscoveredModels {
+  provider_id: string
+  count: number
+  models: { model: string; label: string | null; known: boolean }[]
 }
 
 export interface TeamRole {
@@ -228,6 +320,9 @@ export interface TeamRole {
   name: string
   instructions: string
   orchestrator?: boolean
+  /** A provider this role prefers, or null for the job's. */
+  provider_id?: string | null
+  model?: string | null
 }
 
 export interface Team {

@@ -22,7 +22,14 @@ from app.deps import db
 from app.logging_setup import get_logger
 from app.models import ProviderUpsert, TemplateCreate
 from app.config import settings
-from app.orchestrator.providers import ProviderConfigError, resolve_secret
+from app.orchestrator.providers import (
+    PROVIDER_KINDS,
+    PROVIDER_TEMPLATES,
+    ProviderConfigError,
+    ProviderError,
+    discover_models,
+    resolve_secret,
+)
 from app.orchestrator.roles import TeamError, load_team
 from app.orchestrator.sandbox import default_kind, status as sandbox_status
 
@@ -31,6 +38,21 @@ log = get_logger("agent_hub.api.config")
 router = APIRouter(prefix="/api", tags=["config"])
 
 ProviderId = Annotated[str, Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")]
+
+
+async def _models_for(provider_id: str) -> list[dict[str, Any]]:
+    rows = await db.fetch_all(
+        "select model,label,supports_tools from provider_models where provider_id=? order by model",
+        (provider_id,),
+    )
+    return [
+        {
+            "model": row["model"],
+            "label": row["label"],
+            "supports_tools": bool(row["supports_tools"]),
+        }
+        for row in rows
+    ]
 
 
 def _provider_dict(row: Any) -> dict[str, Any]:
@@ -46,6 +68,7 @@ def _provider_dict(row: Any) -> dict[str, Any]:
     except json.JSONDecodeError:
         profile["headers"] = {}
     profile["enabled"] = bool(profile.get("enabled"))
+    profile["supports_tools"] = bool(profile.get("supports_tools", 1))
 
     if profile.get("secret_ref"):
         try:
@@ -57,10 +80,34 @@ def _provider_dict(row: Any) -> dict[str, Any]:
     return profile
 
 
+@router.get("/provider-kinds")
+async def list_provider_kinds() -> list[dict[str, Any]]:
+    """The wire protocols this build can speak.
+
+    Exposed so the provider form can *ask* which API an endpoint speaks instead of
+    leaving the operator to find out from a failed job. There is one adapter class per
+    entry, so this list is short and only grows with a deploy.
+    """
+    return [dict(kind) for kind in PROVIDER_KINDS]
+
+
+@router.get("/provider-templates")
+async def list_provider_templates() -> list[dict[str, Any]]:
+    """Presets that fill in a new profile for a known vendor.
+
+    Distinct from kinds: a template is codeless, so there are many, and picking one
+    answers base URL, dialect, secret name and a starting model list in one click.
+    """
+    return [dict(template) for template in PROVIDER_TEMPLATES]
+
+
 @router.get("/providers")
 async def list_providers() -> list[dict[str, Any]]:
     rows = await db.fetch_all("select * from provider_profiles order by rowid")
-    return [_provider_dict(row) for row in rows]
+    profiles = [_provider_dict(row) for row in rows]
+    for profile in profiles:
+        profile["models"] = await _models_for(profile["id"])
+    return profiles
 
 
 @router.put("/providers/{provider_id}")
@@ -68,29 +115,88 @@ async def upsert_provider(provider_id: ProviderId, payload: ProviderUpsert) -> d
     if payload.id != provider_id:
         raise HTTPException(status_code=400, detail="id in the body must match the path")
 
-    await db.execute(
-        "insert into provider_profiles(id,label,kind,base_url,model,secret_ref,headers,enabled,"
-        "created_at) values(?,?,?,?,?,?,?,?,unixepoch('subsec'))"
-        " on conflict(id) do update set"
-        "  label=excluded.label,kind=excluded.kind,base_url=excluded.base_url,"
-        "  model=excluded.model,secret_ref=excluded.secret_ref,headers=excluded.headers,"
-        "  enabled=excluded.enabled",
-        (
-            payload.id,
-            payload.label,
-            payload.kind,
-            payload.base_url,
-            payload.model,
-            payload.secret_ref,
-            json.dumps(payload.headers),
-            int(payload.enabled),
-        ),
-    )
+    # The profile row and its model list are written together: a profile whose default
+    # model is not in its own list would be selectable in the UI and unusable in a job.
+    async with db.transaction() as conn:
+        await conn.execute(
+            "insert into provider_profiles(id,label,kind,base_url,model,secret_ref,headers,enabled,"
+            "supports_tools,created_at) values(?,?,?,?,?,?,?,?,?,unixepoch('subsec'))"
+            " on conflict(id) do update set"
+            "  label=excluded.label,kind=excluded.kind,base_url=excluded.base_url,"
+            "  model=excluded.model,secret_ref=excluded.secret_ref,headers=excluded.headers,"
+            "  enabled=excluded.enabled,supports_tools=excluded.supports_tools",
+            (
+                payload.id,
+                payload.label,
+                payload.kind,
+                payload.base_url,
+                payload.model,
+                payload.secret_ref,
+                json.dumps(payload.headers),
+                int(payload.enabled),
+                int(payload.supports_tools),
+            ),
+        )
+        keep = [entry.model for entry in payload.models]
+        placeholders = ",".join("?" for _ in keep)
+        # Removed models are deleted rather than kept as history: `job_agent_providers`
+        # stores the model as plain text with no foreign key precisely so an old job
+        # keeps naming what it ran, even after the operator prunes the list.
+        await conn.execute(
+            f"delete from provider_models where provider_id=? and model not in ({placeholders})"
+            if keep
+            else "delete from provider_models where provider_id=?",
+            (payload.id, *keep),
+        )
+        for entry in payload.models:
+            await conn.execute(
+                "insert into provider_models(provider_id,model,label,supports_tools,created_at)"
+                " values(?,?,?,?,unixepoch('subsec'))"
+                " on conflict(provider_id,model) do update set"
+                "  label=excluded.label,supports_tools=excluded.supports_tools",
+                (payload.id, entry.model, entry.label, int(entry.supports_tools)),
+            )
+
     row = await db.fetch_one("select * from provider_profiles where id=?", (payload.id,))
     if row is None:  # pragma: no cover - written immediately above
         raise HTTPException(status_code=500, detail="provider could not be read back")
-    log.info("provider profile saved", extra={"provider": payload.id, "enabled": payload.enabled})
-    return _provider_dict(row)
+    log.info(
+        "provider profile saved",
+        extra={"provider": payload.id, "enabled": payload.enabled, "models": len(payload.models)},
+    )
+    profile = _provider_dict(row)
+    profile["models"] = await _models_for(payload.id)
+    return profile
+
+
+@router.post("/providers/{provider_id}/models/discover")
+async def discover_provider_models(provider_id: ProviderId) -> dict[str, Any]:
+    """Ask the endpoint what it serves, and report it without saving anything.
+
+    Read-only on purpose. A gateway may list hundreds of models, and quietly writing
+    all of them into the profile would turn the model picker into a haystack — the
+    operator chooses from this and saves what they want.
+    """
+    row = await db.fetch_one("select * from provider_profiles where id=?", (provider_id,))
+    if row is None:
+        raise HTTPException(status_code=404, detail="provider not found")
+
+    profile = _provider_dict(row)
+    try:
+        found = await discover_models(profile)
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ProviderError as exc:
+        # 502, not 500: the endpoint answered badly or not at all, and the operator can
+        # still type model ids in by hand.
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    known = {entry["model"] for entry in await _models_for(provider_id)}
+    return {
+        "provider_id": provider_id,
+        "count": len(found),
+        "models": [{**entry, "known": entry["model"] in known} for entry in found],
+    }
 
 
 @router.delete("/providers/{provider_id}")
@@ -104,18 +210,29 @@ async def delete_provider(provider_id: ProviderId) -> dict[str, Any]:
     if not await db.exists("select 1 from provider_profiles where id=?", (provider_id,)):
         raise HTTPException(status_code=404, detail="provider not found")
 
-    in_use = await db.fetch_value(
-        "select count(*) from jobs where provider_id=?", (provider_id,), default=0
+    # Both references count. A profile can now be named by a single agent of a job
+    # whose own `provider_id` is something else, and deleting it would erase the record
+    # of what that agent actually ran on.
+    in_use = int(
+        await db.fetch_value(
+            "select count(*) from jobs where provider_id=?", (provider_id,), default=0
+        )
+    ) + int(
+        await db.fetch_value(
+            "select count(*) from job_agent_providers where provider_id=?",
+            (provider_id,),
+            default=0,
+        )
     )
     if in_use:
         await db.execute("update provider_profiles set enabled=0 where id=?", (provider_id,))
-        return {"id": provider_id, "deleted": False, "disabled": True, "jobs": int(in_use)}
+        return {"id": provider_id, "deleted": False, "disabled": True, "jobs": in_use}
 
     try:
         await db.execute("delete from provider_profiles where id=?", (provider_id,))
     except IntegrityError:
         await db.execute("update provider_profiles set enabled=0 where id=?", (provider_id,))
-        return {"id": provider_id, "deleted": False, "disabled": True, "jobs": int(in_use)}
+        return {"id": provider_id, "deleted": False, "disabled": True, "jobs": in_use}
     return {"id": provider_id, "deleted": True, "disabled": False, "jobs": 0}
 
 

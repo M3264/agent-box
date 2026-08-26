@@ -7,7 +7,6 @@ import pytest
 
 from app.db import db
 from app.migrations import discover, migrate
-from app.orchestrator import engine as engine_mod
 from app.orchestrator.providers import ProviderError
 from tests.conftest import FakeProvider, phase_rows, wait_for_job
 
@@ -160,14 +159,16 @@ async def test_blank_task_is_rejected(client: httpx.AsyncClient) -> None:
 
 
 async def test_unusable_provider_fails_the_job_and_closes_its_phases(
-    client: httpx.AsyncClient, job, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient, job, pool
 ) -> None:
     """A provider that cannot even be built fails the job before phase 0 runs."""
 
-    def unusable(profile, client=None):  # noqa: ANN001, ANN202
+    async def unusable(provider_id=None, model=None):  # noqa: ANN001, ANN202
         raise ProviderError("secret 'AGENT_HUB_NO_SUCH_SECRET' not found")
 
-    monkeypatch.setattr(engine_mod, "build_provider", unusable)
+    # The pool is where a provider is built now, and it is asked once per phase — so
+    # this also covers the case of a profile that stops resolving partway through a job.
+    pool.get = unusable
 
     job_id = await job()
     assert await wait_for_job(job_id, "error") == "error"

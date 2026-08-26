@@ -37,6 +37,15 @@ export interface JobStream {
   error: string | null
   /** Re-read the job from the server; used after operator actions. */
   refresh: () => Promise<void>
+  /**
+   * Re-read *and* reopen the socket.
+   *
+   * The server closes the stream when a job goes terminal, and `finished` latches so
+   * `onclose` does not fight it. A continuation makes that job live again, which is
+   * the one case where the latch has to be released deliberately — without this, a
+   * continued job sits at its old state until the operator reloads the page.
+   */
+  reopen: () => Promise<void>
 }
 
 /** Whether a job can still change on its own. */
@@ -79,6 +88,14 @@ export function useJobStream(jobId: string): JobStream {
             approvals: snapshot.approvals,
             tool_calls: snapshot.tool_calls,
             sandbox: snapshot.sandbox,
+            usage: snapshot.usage,
+            agent_providers: snapshot.agent_providers,
+            can_continue: snapshot.can_continue,
+            rounds: snapshot.rounds,
+            prompt_tokens: snapshot.prompt_tokens,
+            completion_tokens: snapshot.completion_tokens,
+            total_tokens: snapshot.total_tokens,
+            provider_calls: snapshot.provider_calls,
           },
     )
   }, [])
@@ -271,8 +288,18 @@ export function useJobStream(jobId: string): JobStream {
     }
   }, [connect, refresh])
 
+  const reopen = useCallback(async () => {
+    await refresh()
+    if (!alive.current) return
+    // Only the latch is cleared. The cursor is left where it is so the reopened stream
+    // replays from the last event seen rather than duplicating the whole transcript.
+    finished.current = false
+    attempt.current = 0
+    if (socket.current === null) connect()
+  }, [connect, refresh])
+
   return useMemo(
-    () => ({ job, events, connection, error, refresh }),
-    [job, events, connection, error, refresh],
+    () => ({ job, events, connection, error, refresh, reopen }),
+    [job, events, connection, error, refresh, reopen],
   )
 }

@@ -28,6 +28,13 @@ class Role:
     name: str
     instructions: str
     orchestrator: bool = False
+    #: A provider this role prefers, or None for "whatever the job uses". Set on the
+    #: template so a team can be built out of different models on purpose — a cheap
+    #: fast model for the researcher, a stronger one for the reviewer — without the
+    #: operator re-picking it on every job. A per-job assignment still overrides it.
+    provider_id: str | None = None
+    #: A model on that provider, or None for the provider's default.
+    model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +69,12 @@ class Team:
         return tuple(role.id for role in self.roles)
 
 
+def _optional(value: Any) -> str | None:
+    """Empty strings from a form become None, not a provider called ``""``."""
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
 def _parse_roles(raw: str, team_id: int) -> tuple[Role, ...]:
     try:
         payload = json.loads(raw)
@@ -80,6 +93,10 @@ def _parse_roles(raw: str, team_id: int) -> tuple[Role, ...]:
                 name=str(entry.get("name") or entry["id"].replace("_", " ").title()),
                 instructions=str(entry.get("instructions") or ""),
                 orchestrator=bool(entry.get("orchestrator")),
+                # Absent in every template written before per-role providers existed,
+                # which is exactly what None means here.
+                provider_id=_optional(entry.get("provider_id")),
+                model=_optional(entry.get("model")),
             )
         )
 

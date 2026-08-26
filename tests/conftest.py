@@ -148,6 +148,10 @@ class FakeProvider:
         self.fail_after: int | None = None
         self.fail_with = "upstream returned 502"
         self.tool_script: list[ScriptedTurn] = []
+        #: Reported on every completion, so a test can assert the ledger without a live
+        #: endpoint. Deliberately the OpenAI spelling — `normalize_usage` is tested
+        #: directly for the other dialects.
+        self.usage: dict[str, Any] = {"prompt_tokens": 10, "completion_tokens": 4}
         #: Every ``tools`` argument received, so a test can assert the schemas were
         #: actually offered rather than inferring it from behaviour.
         self.tools_seen: list[list[dict[str, Any]] | None] = []
@@ -193,27 +197,36 @@ class FakeProvider:
             raise ProviderError(self.fail_with)
 
         if PLAN_MARKER in prompt:
-            return Completion(text=json.dumps(self.plan), model=self.model)
+            return Completion(text=json.dumps(self.plan), model=self.model, usage=dict(self.usage))
 
         if tools and self.tool_script:
             return self._scripted(self.tool_script.pop(0))
 
         first_line = prompt.splitlines()[0] if prompt else ""
-        return Completion(text=f"[{len(self.prompts)}] output for {first_line}", model=self.model)
+        return Completion(
+            text=f"[{len(self.prompts)}] output for {first_line}",
+            model=self.model,
+            usage=dict(self.usage),
+        )
 
     def _scripted(self, turn: ScriptedTurn) -> Completion:
         if not turn.calls:
-            return Completion(text=turn.text or "nothing further", model=self.model)
+            return Completion(
+                text=turn.text or "nothing further", model=self.model, usage=dict(self.usage)
+            )
 
         self.tool_calls_made += len(turn.calls)
         if turn.envelope:
             name, args = turn.calls[0]
             return Completion(
-                text=json.dumps({"tool": name, "args": args}), model=self.model
+                text=json.dumps({"tool": name, "args": args}),
+                model=self.model,
+                usage=dict(self.usage),
             )
         return Completion(
             text=turn.text,
             model=self.model,
+            usage=dict(self.usage),
             tool_calls=[
                 ToolCallRequest(
                     id=f"call_{self.tool_calls_made}_{index}",
@@ -234,15 +247,60 @@ class FakeProvider:
         return [prompt for prompt in self.prompts if needle in prompt]
 
 
+class FakePool:
+    """Stands in for :class:`ProviderPool` and hands out one fake for every request.
+
+    ``asked`` records each ``(provider_id, model)`` the engine resolved, which is how the
+    per-agent assignment tests assert what *would* have been called without needing two
+    live endpoints. The fake is shared across agents on purpose: tests script it as one
+    conversation, and a per-agent instance would split that script.
+    """
+
+    def __init__(self, provider: FakeProvider) -> None:
+        self.provider = provider
+        self.asked: list[tuple[str | None, str | None]] = []
+        self.entered = 0
+
+    async def __aenter__(self) -> FakePool:
+        self.entered += 1
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+    async def profile(self, provider_id: str | None = None) -> dict[str, Any]:
+        return {"id": provider_id or self.provider.id, "model": self.provider.model}
+
+    async def get(
+        self, provider_id: str | None = None, model: str | None = None
+    ) -> FakeProvider:
+        self.asked.append((provider_id, model))
+        return self.provider
+
+
 @pytest.fixture
 def provider() -> FakeProvider:
     return FakeProvider()
 
 
+@pytest.fixture
+def pool(provider: FakeProvider) -> FakePool:
+    return FakePool(provider)
+
+
 @pytest.fixture(autouse=True)
-def patch_provider(monkeypatch: pytest.MonkeyPatch, provider: FakeProvider) -> FakeProvider:
-    """Route every provider call to the fake, in the engine and at job creation."""
-    monkeypatch.setattr(engine_mod, "build_provider", lambda profile, client=None: provider)
+def patch_provider(
+    monkeypatch: pytest.MonkeyPatch, provider: FakeProvider, pool: FakePool
+) -> FakeProvider:
+    """Route every provider call to the fake.
+
+    The seam is the pool, not ``build_provider``: the engine now opens one pool per job
+    and asks it per phase, so patching the constructor is what keeps a single fake
+    reachable from every agent regardless of what provider or model that agent named.
+    ``build_provider`` itself is deliberately left alone, so the tests that exercise the
+    real pool and the real adapters against a mock transport still reach them.
+    """
+    monkeypatch.setattr(engine_mod, "ProviderPool", lambda *a, **kw: pool)
     return provider
 
 
@@ -258,6 +316,15 @@ async def database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIter
             " values('fake','Fake','openai_compatible','http://localhost:1/v1','fake-1',"
             "null,'{}',1,unixepoch('subsec'))"
         )
+        # The model list matters now: a per-agent assignment naming a model the profile
+        # does not serve is rejected at job creation, so a profile with an empty list
+        # would make that check vacuous in every test.
+        for model in ("fake-1", "fake-2"):
+            await db.execute(
+                "insert into provider_models(provider_id,model,label,supports_tools,created_at)"
+                " values('fake',?,null,1,unixepoch('subsec'))",
+                (model,),
+            )
         try:
             yield
         finally:

@@ -1,4 +1,4 @@
-"""§8 item 9: job detail at 390px — stacked, all seven tabs reachable.
+"""§8 item 9: job detail at 390px — stacked, every tab reachable.
 
 Reading the CSS is not the same as rendering it, so this drives a real browser at a
 390x844 viewport (iPhone 14). It checks three things per tab: the tab is clickable,
@@ -19,8 +19,10 @@ from playwright.sync_api import sync_playwright
 from app.streams import TERMINAL_STATUSES
 
 BASE = "http://127.0.0.1:8090"
-# Commands sits where the tab strip is widest, so adding it is exactly the change
-# most likely to push the strip off-screen — which is what this checks.
+# Every tab that is always present. `Result` is deliberately absent: it only renders
+# once a job has a final answer, so requiring it would fail on a running job for a
+# reason that has nothing to do with layout. The at-rest position check below covers
+# it anyway, because it measures whatever tabs the strip actually has.
 TABS = [
     "Conversation",
     "Timeline",
@@ -29,6 +31,7 @@ TABS = [
     "Commands",
     "Artifacts",
     "Approvals",
+    "Usage",
 ]
 WIDTH, HEIGHT = 390, 844
 
@@ -154,7 +157,7 @@ def main(job_id: str) -> int:
         for failure in failures:
             print(" -", failure)
         return 1
-    print("OK: 390px layout stacked, all seven tabs reachable, no horizontal overflow")
+    print("OK: 390px layout stacked, every tab reachable, no horizontal overflow")
     return 0
 
 
