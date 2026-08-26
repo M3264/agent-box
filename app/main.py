@@ -28,6 +28,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from app.api import approvals as approvals_api
+from app.api import attention as attention_api
 from app.api import config as config_api
 from app.api import jobs as jobs_api
 from app.api import stream as stream_api
@@ -87,6 +88,7 @@ app = FastAPI(
 
 app.include_router(jobs_api.router)
 app.include_router(approvals_api.router)
+app.include_router(attention_api.router)
 app.include_router(config_api.router)
 app.include_router(stream_api.router)
 

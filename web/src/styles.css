@@ -1,24 +1,48 @@
 /*
  * Agent Hub UI.
  *
- * The look is an instrument panel with a lab notebook wrapped around it. Three
- * voices, each with one job, and the discipline is in not mixing them:
+ * The look is an instrument panel with a lab notebook wrapped around it. Five voices
+ * out of three font requests, each with one job, and the discipline is in not mixing
+ * them:
  *
- *   Instrument Serif  headings and the words a person wrote
- *   Archivo           prose, controls, everything you click
- *   IBM Plex Mono     figures, ids, commands — anything a machine emitted
+ *   Instrument Serif          headings, phase names, and the words a person wrote
+ *   Instrument Serif italic   the notebook's own hand — margin notes, asides, hints
+ *   Archivo                   prose, controls, everything you click
+ *   Archivo at `--cond`       micro-labels: the rail, chips, tabs, table heads
+ *   IBM Plex Mono             figures, ids, commands — anything a machine emitted
  *
- * There is no brand hue. Chrome is warm near-black and ivory, and the entire colour
- * budget is spent on the six tones in `format.ts::tone()`, rendered as LED lamps
- * with a faint bloom. On a screen whose whole purpose is "what needs me", a
- * decorative accent competing with the status colours costs more than it gives.
+ * The two extra voices cost nothing: `index.html` already loads Archivo's `wdth`
+ * axis and Instrument Serif's `ital` axis, so a condensed label and an italic aside
+ * are variations of faces already on the page.
+ *
+ * Colour is spent in three separate budgets, and the separation is the whole point:
+ *
+ *   1. **Status** — the six tones in `format.ts::tone()`, rendered as LED lamps with
+ *      a faint bloom. These remain the *only* colour that answers "how is this
+ *      going", and nothing else in the interface is allowed to.
+ *   2. **Identity** — the speaker palette in `lib/voices.ts`, handed to CSS as
+ *      `--who` on the element. Violets, blues, teals and dusty pinks, chosen away
+ *      from the tones, spent on an avatar ring, a name, and the hairline down the
+ *      left edge of a turn, a command, a question and a plan row. It says who, never
+ *      how.
+ *   3. **Ground** — warm near-black and ivory, plus `--paper`, a hair warmer than
+ *      the panels, used only where the operator's own words sit.
  *
  * Corners are nearly square (3px) and rules are hairlines. That is deliberate: the
  * rounded-card-on-navy dashboard is what this replaced.
  *
- * Layout is mobile-first — stacked rules are the base, the desktop grid is layered
- * on at 860px, and the top bar becomes a fixed left rail at 1100px. Job detail has
- * to work at 390px with every tab reachable, which is easier to guarantee this way
+ * The structure is a rail and a stage. The rail is a bottom dock on a phone and a
+ * left rail from 900px — the same element, moved by the grid. The stage is one
+ * screen, and a job's screen is a *console*: a small permanent head, one
+ * chronological stream that hides nothing behind a tab, an inspector rail for the
+ * five questions a stream answers badly, and a composer docked to the bottom where
+ * it can always be reached. The nine-tab strip this replaced took a single sequence
+ * of events and scattered it across nine places, none of which was where the work
+ * was happening.
+ *
+ * Layout is mobile-first: stacked rules are the base, the console's internal
+ * scrolling starts at 900px, and the inspector becomes a rail beside the stream at
+ * 1180px. Everything has to work at 390px, which is easier to guarantee this way
  * round.
  */
 
@@ -29,6 +53,10 @@
   --panel: #0f0f11;
   --raised: #151518;
   --hover: #1d1d21;
+  /* One step warmer than `--panel`, and the only surface that differs in hue rather
+     than in lightness. Reserved for the operator's own words: what you typed should
+     be findable in a long transcript without reading it. */
+  --paper: #131210;
 
   /* Hairlines are ink at low alpha, not separate greys, so they stay correct over
      any of the three surfaces. */
@@ -41,7 +69,7 @@
   --ink-3: #837d74;
   --ink-4: #5b5650;
 
-  /* The six tones. Nothing else in the interface is coloured. */
+  /* The six tones. The only colour that reports state. */
   --good: #86d99b;
   --busy: #6cc7e8;
   --warn: #edb355;
@@ -49,13 +77,21 @@
   --idle: #9a938a;
   --muted: #6f6a63;
 
+  /* Set per element by `voices.ts::voiceOf()`. The fallback matters: an element with
+     no speaker still reads its own edge colour from here rather than losing it. */
+  --who: var(--ink-2);
+
   --serif: "Instrument Serif", "Iowan Old Style", Georgia, "Times New Roman", serif;
   --sans: "Archivo", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  /* Archivo's `wdth` axis, which `index.html` loads. Used on micro-labels, where
+     fitting the word matters more than the shape of it. */
+  --cond: 77%;
 
   --r: 3px;
   --r-lg: 5px;
-  --rail: 232px;
+  --rail: 216px;
+  --inspector: 336px;
   --shadow: 0 20px 52px -14px rgb(0 0 0 / 85%);
   --measure: 74ch;
 }
@@ -98,9 +134,7 @@ body::after {
 }
 
 #root {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  min-height: 100%;
+  height: 100%;
 }
 
 h1,
@@ -183,8 +217,7 @@ a {
 .sr-only {
   position: absolute;
   width: 1px;
-  height: 1px
-  ;
+  height: 1px;
   padding: 0;
   margin: -1px;
   overflow: hidden;
@@ -222,22 +255,35 @@ a {
 
 /* ------------------------------------------------------------------ app shell */
 
-.topbar {
-  position: sticky;
-  top: 0;
-  z-index: 40;
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 10px 16px;
-  padding-top: max(10px, env(safe-area-inset-top));
-  background: rgb(9 9 10 / 88%);
-  backdrop-filter: blur(14px) saturate(120%);
-  border-bottom: 1px solid var(--line);
+/*
+ * Rail and stage. On a phone the rail is a dock at the bottom, where the thumb is;
+ * from 900px it is the same element as a column down the left. The app is exactly
+ * one viewport tall and never scrolls itself — whatever is on the stage owns its own
+ * scrolling, which is what lets a job's stream behave like a terminal rather than
+ * like a very long web page.
+ */
+.app {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  height: 100dvh;
+  min-height: 0;
 }
 
-.brand {
+.rail {
+  grid-row: 2;
+  z-index: 40;
   display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 4px 6px;
+  padding-bottom: max(4px, env(safe-area-inset-bottom));
+  background: rgb(9 9 10 / 92%);
+  backdrop-filter: blur(14px) saturate(120%);
+  border-top: 1px solid var(--line);
+}
+
+.rail-brand {
+  display: none;
   align-items: center;
   gap: 9px;
   flex: none;
@@ -258,73 +304,145 @@ a {
   letter-spacing: 0.005em;
 }
 
-.nav {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  margin-left: 8px;
-}
-
-.nav-link {
+/*
+ * One rule for five things: three destinations, Find and New job. They are a mix of
+ * links and buttons in the DOM and they should not look like it — what an operator
+ * is choosing between is five places to go, not two kinds of control.
+ */
+.rail-link {
   position: relative;
   display: flex;
+  flex: 1;
+  flex-direction: column;
   align-items: center;
-  gap: 6px;
-  padding: 7px 11px;
+  justify-content: center;
+  gap: 3px;
+  min-width: 0;
+  padding: 7px 4px 6px;
+  border: none;
   border-radius: var(--r);
+  background: transparent;
   color: var(--ink-3);
-  font-size: 13px;
-  font-weight: 500;
-  white-space: nowrap;
+  font: 500 13px/1.3 var(--sans);
+  text-align: center;
+  cursor: pointer;
   transition: color 120ms, background 120ms;
 }
 
-.nav-link:hover {
+.rail-link:hover {
   color: var(--ink);
   background: var(--line-soft);
 }
 
-.nav-link.active {
+.rail-link.active {
   color: var(--ink);
 }
 
-/* The active mark is a tick beneath the label, like a scale marking. */
-.nav-link.active::after {
+/* The active mark is a tick on the rail's own edge, like a scale marking: along the
+   top on the dock, down the left once it is a column. */
+.rail-link.active::after {
   content: "";
   position: absolute;
-  left: 11px;
-  right: 11px;
-  bottom: 2px;
+  left: 22%;
+  right: 22%;
+  top: 0;
   height: 1.5px;
   background: var(--ink);
 }
 
-.nav-count {
+.rail-icon {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+}
+
+.rail-icon .icon {
+  width: 19px;
+  height: 19px;
+}
+
+.rail-text {
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+/* On the dock the count rides the icon, because there is no room beside the word. */
+.rail-count {
+  position: absolute;
+  top: -5px;
+  left: 11px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 17px;
-  height: 17px;
+  min-width: 15px;
+  height: 15px;
   padding: 0 4px;
   border-radius: 99px;
   background: var(--warn);
   color: #0b0a06;
-  font-family: var(--mono);
-  font-size: 10.5px;
-  font-weight: 600;
+  font: 600 10px/1 var(--mono);
 }
 
-.topbar-right {
-  display: flex;
+.rail-key {
+  display: none;
+  padding: 1px 4px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink-4);
+  font: 500 10px/1.5 var(--mono);
+}
+
+.rail-gap {
+  display: none;
+}
+
+/* New job is the one thing on the rail that makes something exist, so it is the one
+   thing on it drawn as a control. */
+.rail-new {
+  color: var(--ink);
+}
+
+.rail-new .rail-icon {
+  padding: 2px;
+  border: 1px solid var(--line-hard);
+  border-radius: 50%;
+}
+
+.rail-new:hover .rail-icon {
+  border-color: var(--ink);
+}
+
+/* Silent when the service is fine: a status reported four hundred times a day is not
+   news, and the dock has no room for it. */
+.rail-health {
+  display: none;
   align-items: center;
-  gap: 10px;
-  margin-left: auto;
+  gap: 6px;
+  padding: 0 6px;
+  color: var(--ink-3);
+  font: 500 11.5px/1.4 var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
-.content {
-  padding: 16px 14px 64px;
-  padding-bottom: max(64px, env(safe-area-inset-bottom));
+.rail-health:not(.health-ok) {
+  display: flex;
+  flex: none;
+  align-self: center;
+}
+
+.stage {
+  grid-row: 1;
   min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 12px 20px;
 }
 
 .screen {
@@ -341,6 +459,29 @@ a {
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
+}
+
+/* The condensed micro-label above a heading: what kind of screen this is, said once
+   and quietly, so the heading underneath can be a sentence about right now. */
+.eyebrow {
+  color: var(--ink-4);
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+/* The notebook's hand: an aside from the app about how the screen works. */
+.screen-note {
+  max-width: 46ch;
+  color: var(--ink-3);
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1.02rem;
+  line-height: 1.45;
 }
 
 /* --------------------------------------------------------------------- controls */
@@ -408,6 +549,19 @@ a {
 .button.danger:hover:not(:disabled) {
   background: rgb(255 125 114 / 10%);
   border-color: rgb(255 125 114 / 55%);
+}
+
+/*
+ * Every inline SVG from `icons.tsx`. Sized here rather than in the component so a
+ * glyph inherits the text size of whatever it sits in, which is what keeps it at the
+ * weight of the rules around it — 1.4px strokes at 16px look like hairlines, and at
+ * 30px look like a logo.
+ */
+.icon {
+  width: 1.15em;
+  height: 1.15em;
+  flex: none;
+  display: block;
 }
 
 .icon-button {
@@ -606,24 +760,28 @@ a {
   border-top: 1px solid var(--line-soft);
 }
 
-/* Chip rows are filters. Small, monospaced, and quiet until chosen. */
-.chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-}
-
+/*
+ * A chip is a cut through something, or a one-word statement about it. Set in
+ * condensed Archivo rather than mono: these are words a person wrote for another
+ * person to read ("everything", "at the next phase"), not values a machine emitted,
+ * and the condensed face lets five of them share one line at 390px.
+ */
 .chip {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 4px 9px;
+  padding: 4px 10px;
   border: 1px solid var(--line);
   border-radius: 99px;
   background: transparent;
   color: var(--ink-3);
-  font: 500 11.5px/1.4 var(--mono);
-  letter-spacing: 0.01em;
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.45;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
   cursor: pointer;
   transition: color 120ms, border-color 120ms, background 120ms;
 }
@@ -645,8 +803,48 @@ a {
 }
 
 .chip-count {
+  font-family: var(--mono);
+  font-size: 10.5px;
   font-variant-numeric: tabular-nums;
   opacity: 0.62;
+}
+
+.chip-on .chip-count {
+  opacity: 0.5;
+}
+
+/* Two tone-tinted chips, for the one place a chip states a fact about delivery
+   rather than offering a filter. */
+.chip-busy {
+  color: var(--busy);
+  border-color: rgb(108 199 232 / 40%);
+  background: rgb(108 199 232 / 9%);
+  cursor: default;
+}
+
+.chip-idle {
+  color: var(--idle);
+  cursor: default;
+}
+
+/* The phase cut, which came from clicking the plan spine rather than from this row —
+   so it says which phase, and carries its own way out. */
+.chip-phase {
+  border-color: var(--ink-4);
+  color: var(--ink);
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chip-x {
+  color: var(--ink-3);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.chip-phase:hover .chip-x {
+  color: var(--ink);
 }
 
 /* ------------------------------------------------------------ status primitives */
@@ -660,6 +858,26 @@ a {
   border-radius: 50%;
   background: currentColor;
   box-shadow: 0 0 7px currentColor;
+}
+
+/* A dot outside a pill has no tone from its surroundings, so it names its own. */
+.dot-good {
+  color: var(--good);
+}
+.dot-busy {
+  color: var(--busy);
+}
+.dot-warn {
+  color: var(--warn);
+}
+.dot-bad {
+  color: var(--bad);
+}
+.dot-idle {
+  color: var(--idle);
+}
+.dot-muted {
+  color: var(--muted);
 }
 
 .pill {
@@ -755,16 +973,8 @@ a {
   transition: width 400ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
-.health {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font: 500 11.5px/1.4 var(--mono);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--ink-3);
-}
-
+/* The service's own tone, set beside `.rail-health` on the same element. Only the
+   layout lives there; which of the three it is, lives here. */
 .health-ok {
   color: var(--good);
 }
@@ -777,9 +987,10 @@ a {
   color: var(--muted);
 }
 
-/* The stream indicator sits in the job header's meta line and has to stay quiet
-   while live — a connected socket is the expected state, not news. */
-.stream {
+/* The socket indicator in the console's meta line. It has to stay quiet while live —
+   a connected socket is the expected state, not news. Named apart from `.stream`,
+   which is the scroller the session lands in. */
+.stream-state {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -1012,8 +1223,7 @@ a {
   overflow: hidden;
 }
 
-.job-meta,
-.job-head-meta {
+.job-meta {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -1023,13 +1233,11 @@ a {
   font-size: 11.5px;
 }
 
-.job-meta code,
-.job-head-meta code {
+.job-meta code {
   color: var(--ink-3);
 }
 
-.job-progress,
-.job-head-progress {
+.job-progress {
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -1049,41 +1257,55 @@ a {
   gap: 6px;
 }
 
-/* ------------------------------------------------------------------ job detail */
+/* -------------------------------------------------------------- session console */
 
-.job-screen {
-  gap: 14px;
-}
-
-.job-head {
+/*
+ * A job is a console, not a document with a tab strip over it. Three bands: a small
+ * permanent head, a body that takes everything left, and a composer docked to the
+ * bottom of the body — so the way to say something to the team is in the same place
+ * no matter what the inspector is showing.
+ *
+ * Mobile first, this just flows and the stage scrolls. A 390px viewport cannot afford
+ * to give a fixed head, a chip row and a composer their own bands and still leave
+ * anything to read in between. From 900px the console is exactly as tall as the stage
+ * and the stream scrolls inside it, which is the arrangement that makes it read like
+ * a session someone is sitting in front of.
+ */
+.console {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding-bottom: 14px;
+  gap: 12px;
+  width: 100%;
+  max-width: 1320px;
+  margin: 0 auto;
+  min-height: 0;
+}
+
+.console-head {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding-bottom: 12px;
   border-bottom: 1px solid var(--line);
 }
 
-.job-title {
-  font-size: 1.62rem;
+.console-title h1 {
+  font-size: 1.5rem;
   line-height: 1.22;
   max-width: var(--measure);
 }
 
-.job-head-side {
+.console-meta {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
-  min-width: 220px;
-}
-
-.job-head-status {
-  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 7px;
-  flex-wrap: wrap;
+  margin-top: 7px;
+  color: var(--ink-3);
+  font-size: 12px;
 }
 
-.job-head-status .pill {
+.console-meta .pill {
   cursor: inherit;
 }
 
@@ -1091,166 +1313,464 @@ a.pill:hover {
   filter: brightness(1.25);
 }
 
-.job-controls {
+/* The gauge is the one place in the head where a figure is allowed to be the loudest
+   thing: how far along, and what it has cost so far. */
+.console-gauge {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.console-gauge-text {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.console-spend {
+  color: var(--ink-2);
+  border-bottom: 1px solid var(--line-hard);
+  transition: color 120ms, border-color 120ms;
+}
+
+.console-spend:hover {
+  color: var(--ink);
+  border-bottom-color: var(--ink);
+}
+
+.console-verbs {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
 }
 
-/* The tab strip reads as a scale: hairline baseline, the active tab marked on it. */
-.tabs {
+.console-body {
   display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.console-main {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+}
+
+/*
+ * Narrow, the inspector *replaces* the stream rather than being crushed beside it, and
+ * the composer goes with it — there is nothing to say to a panel. The `data-inspecting`
+ * attribute is the same route state the inspector reads, so a link into `/tokens` lands
+ * on the panel here and beside the stream on a wide screen. Both of these rules are
+ * overridden at 1180px, where there is room for the two of them at once.
+ */
+.console[data-inspecting="true"] .console-main {
+  display: none;
+}
+
+.console[data-inspecting="false"] .inspector {
+  display: none;
+}
+
+/* -------------------------------------------------------------------- inspector */
+
+/*
+ * The five questions a stream answers badly — how far through the plan, who is on what
+ * model, what has this cost, what files came out, and the raw event log — beside the
+ * stream rather than instead of it.
+ *
+ * One structure at two widths. Narrow, the route swaps the stage over to the panel and
+ * the close button goes back to the stream. From 1180px the same markup is a rail down
+ * the right and the close button disappears, because there is nothing to close.
+ */
+.inspector {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.inspector-tabs {
+  display: flex;
+  align-items: center;
   gap: 2px;
+  flex: none;
+  padding-bottom: 8px;
   border-bottom: 1px solid var(--line);
   overflow-x: auto;
   scrollbar-width: none;
 }
 
-.tabs::-webkit-scrollbar {
+.inspector-tabs::-webkit-scrollbar {
   display: none;
 }
 
-.tab {
-  position: relative;
-  display: inline-flex
-  ;
+.inspector-tab {
+  display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 9px 13px;
+  padding: 6px 9px;
+  border-radius: var(--r);
   color: var(--ink-3);
-  font-size: 13px;
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 12px;
   font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
   white-space: nowrap;
-  transition: color 120ms;
+  transition: color 120ms, background 120ms;
 }
 
-.tab:hover {
+.inspector-tab:hover {
   color: var(--ink);
-}
-
-.tab.active {
-  color: var(--ink);
-}
-
-.tab.active::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: -1px;
-  height: 2px;
-  background: var(--ink);
-}
-
-.tab-count {
-  padding: 0 5px;
-  border-radius: 99px;
   background: var(--line-soft);
-  color: var(--ink-3);
+}
+
+.inspector-tab-on {
+  color: var(--ink);
+  background: var(--line);
+}
+
+.inspector-tab-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.inspector-tab-count {
+  color: var(--ink-4);
   font: 500 10.5px/1.7 var(--mono);
   font-variant-numeric: tabular-nums;
 }
 
-.tab.active .tab-count {
-  background: var(--line);
+.inspector-tab-on .inspector-tab-count {
   color: var(--ink-2);
 }
 
-.tab-body {
-  min-height: 40vh;
+.inspector-close {
+  display: inline-flex;
+  margin-left: auto;
+  flex: none;
+  padding: 6px;
+  border-radius: var(--r);
+  color: var(--ink-3);
+  transition: color 120ms, background 120ms;
 }
 
-/* ---------------------------------------------------------------- conversation */
-
-.conversation {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+.inspector-close:hover {
+  color: var(--ink);
+  background: var(--line-soft);
 }
 
-.transcript {
+.inspector-body {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  max-height: min(62vh, 680px);
+  gap: 16px;
+  min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: 8px;
+}
+
+/* ----------------------------------------------------------------------- the cap */
+
+/*
+ * A cap that only exists at creation time is a cap you set before you knew anything.
+ * The interesting moment is halfway through a job that is burning more than expected, so
+ * it is editable here — and the bar fills in ink rather than in a status tone, because
+ * "how full" is a quantity and the pill beside it is what reports whether that is bad.
+ */
+.budget {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--panel);
+}
+
+.budget-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.budget-head h3 {
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.budget-bar {
+  height: 4px;
+  border-radius: 99px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.budget-fill {
+  display: block;
+  height: 100%;
+  background: linear-gradient(to right, var(--ink-4), var(--ink));
+  transition: width 300ms;
+}
+
+.budget-line {
+  color: var(--ink-3);
+  font: 400 11.5px/1.5 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.budget-edit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.budget-edit input {
+  flex: 1;
+  min-width: 96px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--void);
+  color: var(--ink);
+  font: 400 13px/1.4 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.budget-edit input:focus {
+  outline: none;
+  border-color: var(--ink-4);
+}
+
+/* --------------------------------------------------------------- session stream */
+
+/*
+ * One chronological account of a job, and three rules that keep it readable at length:
+ *
+ * 1. **Identity is a colour; status is a colour; they are never the same colour.**
+ *    Anything an agent produced carries a 2px left edge in that agent's `--who`, set
+ *    by `voices.ts` from its name. Tone — good, busy, warn, bad — is spent only on
+ *    pills, marks and dots. So "who did this" and "how did it go" are two separate
+ *    passes over the same column, and neither drowns the other.
+ * 2. **Typeface tracks who is speaking.** What a person wrote is serif on `--paper`.
+ *    What an agent said is prose in a card. What the machine merely noted is one line
+ *    in the serif's italic — the notebook's own hand, in the margin. A note can never
+ *    be mistaken for a turn.
+ * 3. **Nothing is hidden.** The chips narrow; they do not file things elsewhere. Phase
+ *    dividers survive every filter, so the shape of the job is never lost.
+ */
+.stream-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.stream-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.stream {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  /* Capped rather than filled while the console is still a flowing column. At 900px
+     this becomes `flex: 1` and the stream scrolls inside a fixed console instead. */
+  max-height: 56vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding-right: 4px;
   scroll-behavior: smooth;
 }
 
-.turn-slot {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-/* A round divider is a labelled rule — the same device as a chapter break. */
-.round-divider {
+/* A phase divider: the number in the owner's colour, the name in the serif, and a
+   hairline under it. It is the one item in the stream that is not a card, because it
+   is not a thing that happened — it is where the things that happened were filed. */
+.mark {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 11px;
   margin-top: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.mark-seq {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 23px;
+  height: 23px;
+  border: 1px solid var(--who);
+  border-radius: 50%;
+  color: var(--who);
+  font: 600 11px/1 var(--mono);
+}
+
+.mark-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.mark-name {
+  font-family: var(--serif);
+  font-size: 1.14rem;
+  line-height: 1.25;
+}
+
+.mark-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
   color: var(--ink-4);
-  font: 500 10.5px/1 var(--mono);
-  letter-spacing: 0.14em;
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 11px;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
 }
 
-.round-divider::before,
-.round-divider::after {
+.mark-owner {
+  color: var(--who);
+}
+
+.mark-time {
+  flex: none;
+  align-self: flex-start;
+  color: var(--ink-4);
+  font: 400 10.5px/1.9 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A round is a chapter break: the operator came back and asked for more. */
+.round-mark {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  color: var(--ink-3);
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1.04rem;
+}
+
+.round-mark::before,
+.round-mark::after {
   content: "";
   flex: 1;
   height: 1px;
   background: var(--line);
 }
 
-.turn {
+/* Notes in the margin's hand: indented past the avatar column, italic, one line each. */
+.jot {
+  display: flex;
+  gap: 9px;
+  padding-left: 36px;
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1rem;
+  line-height: 1.45;
+}
+
+.jot-plain {
+  color: var(--ink-3);
+}
+
+.jot-bad {
+  color: var(--bad);
+}
+
+.jot-time {
+  flex: none;
+  color: var(--ink-4);
+  font: 400 10.5px/1.8 var(--mono);
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A turn. The left edge is the speaker's colour and nothing else's. */
+.say {
   display: flex;
   gap: 11px;
-  padding: 13px 14px;
+  padding: 12px 14px;
   border: 1px solid var(--line-soft);
   border-radius: var(--r-lg);
   background: var(--panel);
 }
 
-/* What a person typed is set in the serif and pulled brighter: the operator's own
-   words should be findable in a long transcript without reading it. */
-.turn-operator {
+.say-agent {
+  border-left: 2px solid var(--who);
+}
+
+/* The operator's own words: warm ground, serif, full-strength ink. Findable in a long
+   stream without reading a word of it. */
+.say-operator {
   border-color: var(--line-hard);
+  border-left: 2px solid var(--ink);
+  background: var(--paper);
+}
+
+.say-operator .say-prose {
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 1.1rem;
+  line-height: 1.5;
+}
+
+.say-result {
+  border-left: 2px solid var(--good);
   background: var(--raised);
 }
 
-.turn-operator .turn-prose {
-  font-family: var(--serif);
-  font-size: 1.06rem;
-}
-
-.turn-result {
-  border-left: 2px solid var(--good);
-}
-
-.turn-body {
-  min-width: 0;
+.say-body {
   flex: 1;
+  min-width: 0;
 }
 
-.turn-head {
+.say-head {
   display: flex;
   align-items: baseline;
   gap: 8px;
   margin-bottom: 6px;
 }
 
-.turn-who {
-  font-family: var(--mono);
-  font-size: 11.5px;
+.say-who {
+  color: var(--who);
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--ink-2);
 }
 
-.turn-context {
+.say-context {
   padding: 0 5px;
   border: 1px solid var(--line);
   border-radius: 2px;
@@ -1258,8 +1778,7 @@ a.pill:hover {
   font: 400 10.5px/1.7 var(--mono);
 }
 
-.turn-time,
-.turn-note-time {
+.say-time {
   margin-left: auto;
   flex: none;
   color: var(--ink-4);
@@ -1268,63 +1787,33 @@ a.pill:hover {
   font-variant-numeric: tabular-nums;
 }
 
-.turn-note-time {
-  margin-left: 0;
-}
+/* ------------------------------------------------------------------- composer */
 
-.turn-note {
-  display: flex;
-  gap: 9px;
-  padding-left: 41px;
-  color: var(--ink-4);
-  font-size: 12px;
-}
-
-/* Commands sit inline in the transcript, indented like notes but monospaced, so a
-   job reads as a session someone ran rather than a chat log with an audit trail
-   filed somewhere else. */
-.turn-command {
-  display: flex;
-  align-items: baseline;
-  gap: 9px;
-  padding-left: 41px;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--ink-2);
-}
-
-.turn-command-who {
-  color: var(--ink-4);
-  font-size: 10.5px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
+/*
+ * Docked to the bottom of the console, on every job, in every state. In the old shell
+ * this was the tail of one tab out of nine, so saying something to the team began with
+ * navigating back to the screen where the box lived.
+ */
 .composer {
   display: flex;
   flex-direction: column;
   gap: 9px;
-  padding: 13px 14px;
+  flex: none;
+  padding: 11px 12px;
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
   background: var(--panel);
 }
 
-.composer-note {
-  color: var(--ink-3);
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.composer-row {
+.composer-form {
   display: flex;
-  gap: 10px;
-  align-items: flex-end;
+  flex-direction: column;
+  gap: 9px;
 }
 
-.composer-row textarea {
-  flex: 1;
-  min-height: 62px;
+.composer-input {
+  width: 100%;
+  min-height: 58px;
   padding: 9px 11px;
   border: 1px solid var(--line);
   border-radius: var(--r);
@@ -1334,21 +1823,135 @@ a.pill:hover {
   resize: vertical;
 }
 
-.composer-row textarea:focus {
+.composer-input:focus {
   outline: none;
   border-color: var(--ink-4);
 }
 
-.composer-row textarea::placeholder {
+.composer-input::placeholder {
   color: var(--ink-4);
 }
 
+.composer-input:disabled {
+  color: var(--ink-3);
+  cursor: not-allowed;
+}
+
+.composer-side {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* When it lands. Two states, one control, so the choice is visible before you send
+   rather than a setting you went looking for afterwards. */
+.composer-when {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background: var(--void);
+}
+
+.when {
+  padding: 4px 11px;
+  border: none;
+  border-radius: 99px;
+  background: transparent;
+  color: var(--ink-3);
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 120ms, background 120ms;
+}
+
+.when:hover {
+  color: var(--ink);
+}
+
+.when-on {
+  background: var(--line);
+  color: var(--ink);
+}
+
+/* The second of the two interrupts a running agent. Selected, it takes the warn tone:
+   sending now is a decision, and it should not look like the default. */
+.composer-when .when-on:last-child {
+  background: rgb(237 179 85 / 18%);
+  color: var(--warn);
+}
+
+.composer-note {
+  max-width: 48ch;
+  color: var(--ink-3);
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1rem;
+  line-height: 1.45;
+}
+
 .composer-actions {
-  display: flex
-  ;
-  flex-direction: column;
+  display: flex;
+  align-items: center;
   gap: 7px;
   flex: none;
+  margin-left: auto;
+}
+
+/* Queued but unread, above the box it was typed in — the last moment it can change. */
+.composer-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 9px;
+  border-bottom: 1px solid var(--line);
+}
+
+.queue-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--ink-2);
+  font: 500 12.5px/1.5 var(--sans);
+  text-align: left;
+  cursor: pointer;
+  transition: color 120ms;
+}
+
+.queue-toggle:hover {
+  color: var(--ink);
+}
+
+.queue-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--busy);
+  box-shadow: 0 0 0 3px rgb(108 199 232 / 18%);
+}
+
+.queue-toggle-verb {
+  color: var(--ink-4);
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 /* ------------------------------------------------------------------- markdown */
@@ -1501,18 +2104,8 @@ a.pill:hover {
   text-decoration-color: var(--line-hard);
 }
 
-.turn-prose,
-.phase-prose,
-.result-prose {
+.say-prose {
   font-size: 13.5px;
-}
-
-.result-view {
-  padding: 4px 0;
-}
-
-.result-prose {
-  font-size: 14.5px;
 }
 
 /* -------------------------------------------------------------------- timeline */
@@ -1614,175 +2207,153 @@ a.pill:hover {
   color: var(--ink-2);
 }
 
-/* ------------------------------------------------------------------------ plan */
+/* ---------------------------------------------------------------- the plan spine */
 
-.rounds {
+/*
+ * The plan used to be a tab of full-width cards you read instead of the conversation.
+ * In the inspector it is a spine: one dense line per phase, a tone mark for status, the
+ * owner's colour on the owner's name — narrow enough to sit beside the stream and be
+ * consulted rather than visited.
+ *
+ * It is also the one panel that reaches back into the stream. Clicking a phase filters
+ * the stream to it, which answers "what did the tester actually do" in one click.
+ */
+.spine {
   display: flex;
   flex-direction: column;
-  gap: 22px;
+  gap: 14px;
 }
 
-.round-head {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  padding-bottom: 7px;
-  margin-bottom: 10px;
-  border-bottom: 1px solid var(--line);
-  font-size: 1.2rem;
-}
-
-.round-count {
-  margin-left: auto;
-  color: var(--ink-4);
-  font: 500 11px/1.4 var(--mono);
-  font-variant-numeric: tabular-nums;
-}
-
-.phases {
+.spine-round {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  counter-reset: phase;
+  gap: 3px;
 }
 
-.phase {
+.spine-round-head {
+  padding-bottom: 5px;
+  color: var(--ink-3);
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.spine-list {
   display: flex;
   flex-direction: column;
+  gap: 2px;
+}
+
+.spine-row {
+  display: flex;
+  align-items: flex-start;
   gap: 9px;
-  padding: 13px 14px;
-  border: 1px solid var(--line-soft);
-  border-left: 2px solid var(--line-hard);
-  border-radius: var(--r-lg);
-  background: var(--panel);
+  width: 100%;
+  padding: 8px 9px;
+  border: 1px solid transparent;
+  border-radius: var(--r);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms;
 }
 
-/* Not yet started, so the left edge stays neutral and the card sits back. */
-.phase-pending {
-  border-left-color: var(--line);
+.spine-row:hover {
+  background: var(--line-soft);
 }
 
-.phase-active {
-  border-left-color: var(--busy);
+/* The picked phase, which is also the stream's current filter — so it has to be
+   unmistakable from the corner of the eye while reading the stream beside it. */
+.spine-on {
+  border-color: var(--line-hard);
   background: var(--raised);
 }
 
-.phase-complete {
-  border-left-color: var(--good);
-}
-
-.phase-blocked_on_approval {
-  border-left-color: var(--warn);
-}
-
-.phase-failed {
-  border-left-color: var(--bad);
-}
-
-.phase-skipped {
-  opacity: 0.62;
-}
-
-.phase-head {
-  display: flex;
-  align-items: flex-start;
-  gap: 11px;
-}
-
-.phase-seq {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
+.spine-mark {
   flex: none;
-  border: 1px solid var(--line);
+  width: 7px;
+  height: 7px;
+  margin-top: 6px;
   border-radius: 50%;
-  color: var(--ink-3);
-  font: 500 11px/1 var(--mono);
+  background: var(--ink-4);
+}
+
+.spine-good {
+  background: var(--good);
+}
+
+.spine-busy {
+  background: var(--busy);
+  box-shadow: 0 0 0 3px rgb(108 199 232 / 18%);
+}
+
+.spine-warn {
+  background: var(--warn);
+}
+
+.spine-bad {
+  background: var(--bad);
+}
+
+.spine-idle {
+  background: var(--idle);
+}
+
+.spine-muted {
+  background: var(--muted);
+}
+
+.spine-seq {
+  flex: none;
+  color: var(--ink-4);
+  font: 500 10.5px/1.6 var(--mono);
   font-variant-numeric: tabular-nums;
 }
 
-.phase-title {
+.spine-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   min-width: 0;
   flex: 1;
 }
 
-.phase-title h3 {
-  font-size: 1.1rem;
+.spine-name {
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 1.02rem;
+  line-height: 1.3;
 }
 
-.phase-meta {
+.spine-meta {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  margin-top: 3px;
+  gap: 5px;
   color: var(--ink-4);
-  font-size: 11.5px;
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 11px;
+  letter-spacing: 0.02em;
 }
 
-.phase-meta .owner {
-  font-family: var(--mono);
-  color: var(--ink-2);
-}
-
-.phase-acceptance {
-  padding-left: 35px;
-  color: var(--ink-2);
-  font-size: 12.5px;
-}
-
-.phase-acceptance > span {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  letter-spacing: 0.08em;
+.spine-owner {
+  color: var(--who);
   text-transform: uppercase;
-  color: var(--ink-4);
-  margin-right: 6px;
+  letter-spacing: 0.05em;
 }
 
-.phase-error {
-  padding: 8px 11px;
-  border-radius: var(--r);
-  background: rgb(255 125 114 / 8%);
+.spine-error {
   color: #ffb6ae;
   font-family: var(--mono);
-  font-size: 11.5px;
-}
-
-.phase-output {
-  padding-left: 35px;
-}
-
-.phase-output summary {
-  cursor: pointer;
-  color: var(--ink-3);
-  font: 500 11px/1.5 var(--mono);
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  list-style: none;
-}
-
-.phase-output summary::-webkit-details-marker {
-  display: none;
-}
-
-.phase-output summary::before {
-  content: "▸ ";
-  color: var(--ink-4);
-}
-
-.phase-output[open] summary::before {
-  content: "▾ ";
-}
-
-.phase-output summary:hover {
-  color: var(--ink);
-}
-
-.phase-output[open] summary {
-  margin-bottom: 9px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 /* ---------------------------------------------------------------------- agents */
@@ -1857,21 +2428,18 @@ a.pill:hover {
   font-size: 10.5px;
 }
 
-/* -------------------------------------------------------------------- commands */
+/* --------------------------------------------------------- commands, in the stream */
 
-.commands {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.command-list {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-
-.command {
+/*
+ * A command is not a filing-cabinet row on a Commands tab — it is a line in the
+ * session, between the sentence that led to it and the sentence that followed. So it
+ * lives in the stream, folded shut, and opens where it sits.
+ *
+ * Two edges, doing two different jobs: the left border carries *status* tone, because a
+ * failed command is the thing you scan a long stream for; the agent's `--who` colour is
+ * spent on its name in the sub-line, so identity is still there without competing.
+ */
+.cmd {
   border: 1px solid var(--line-soft);
   border-left: 2px solid var(--line-hard);
   border-radius: var(--r);
@@ -1879,29 +2447,36 @@ a.pill:hover {
   overflow: hidden;
 }
 
-.command-good {
+.cmd-good {
   border-left-color: var(--good);
 }
-.command-busy {
+.cmd-busy {
   border-left-color: var(--busy);
 }
-.command-warn {
+.cmd-warn {
   border-left-color: var(--warn);
 }
-.command-bad {
+.cmd-bad {
   border-left-color: var(--bad);
 }
 
 /* Denied, interrupted or cancelled: it never produced a result, so it recedes. */
-.command-muted,
-.command-idle {
+.cmd-muted,
+.cmd-idle {
   border-left-color: var(--line);
   opacity: 0.72;
 }
 
-/* The whole header row is the disclosure control, so it is a button that has to
-   look like a line of terminal output rather than a button. */
-.command-head {
+/* An open command is being read, so it stops receding and gains its own ground. */
+.cmd-open {
+  border-color: var(--line);
+  background: var(--raised);
+  opacity: 1;
+}
+
+/* The whole header row is the disclosure control, so it is a button that has to look
+   like a line of terminal output rather than a button. */
+.cmd-head {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1915,18 +2490,23 @@ a.pill:hover {
   font: inherit;
 }
 
-.command-head:hover {
-  background: var(--raised);
+.cmd-head:hover {
+  background: var(--hover);
 }
 
-.command-caret {
+.cmd-caret {
+  display: inline-flex;
   flex: none;
-  width: 10px;
   color: var(--ink-4);
-  font-size: 10px;
+  transition: transform 140ms;
 }
 
-.command-line {
+.cmd-open .cmd-caret {
+  transform: rotate(90deg);
+  color: var(--ink-2);
+}
+
+.cmd-line {
   flex: 1;
   min-width: 0;
   display: flex;
@@ -1939,13 +2519,18 @@ a.pill:hover {
   white-space: nowrap;
 }
 
-.command-prompt {
+.cmd-open .cmd-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.cmd-prompt {
   flex: none;
   color: var(--good);
   user-select: none;
 }
 
-.command-meta {
+.cmd-meta {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1956,32 +2541,41 @@ a.pill:hover {
   font-variant-numeric: tabular-nums;
 }
 
-.command-exit {
+.cmd-exit {
   color: var(--ink-3);
 }
 
-.command-duration {
+.cmd-duration {
   color: var(--ink-4);
 }
 
-.command-sub {
+.cmd-sub {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 7px;
   padding: 0 12px 9px 34px;
   color: var(--ink-4);
-  font-size: 11px;
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
 }
 
-.command-output {
+.cmd-agent {
+  color: var(--who);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.cmd-output {
   padding: 0 12px 12px 34px;
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-.command-stream {
+.cmd-stream {
   margin: 0;
   padding: 10px 12px;
   border: 1px solid var(--line);
@@ -1997,14 +2591,24 @@ a.pill:hover {
   word-break: break-word;
 }
 
-.command-stream-err {
+.cmd-stream-err {
   border-color: rgb(255 125 114 / 26%);
   color: #ffb6ae;
 }
 
-.command-note {
-  color: var(--ink-4);
-  font-size: 11.5px;
+/* Why nothing ran, why it stopped, where the full log is: prose, not a status code. */
+.cmd-note {
+  max-width: 62ch;
+  color: var(--ink-3);
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 0.98rem;
+  line-height: 1.45;
+}
+
+.cmd-note code {
+  font-style: normal;
+  color: var(--ink-2);
 }
 
 /* ----------------------------------------------------------------------- usage */
@@ -2045,6 +2649,17 @@ a.pill:hover {
 .usage-figure-label {
   color: var(--ink-4);
   font-size: 11px;
+}
+
+/* Money is the one figure here that is an estimate rather than a count, so it says so
+   by looking different: the good tone, and a hairline top edge marking it apart from
+   the token columns beside it. */
+.usage-figure-money {
+  background: linear-gradient(to bottom, rgb(134 217 155 / 7%), transparent 70%), var(--panel);
+}
+
+.usage-figure-money .usage-figure-value {
+  color: var(--good);
 }
 
 .usage-section {
@@ -2174,16 +2789,17 @@ a.pill:hover {
   white-space: nowrap;
 }
 
-/* ------------------------------------------------------------------- approvals */
+/* ------------------------------------------------------- gates, asks, and the queue */
 
-.approvals {
-  display: flex;
-  flex-direction: column;
-  gap: 11px;
-}
+/*
+ * The three things that can be addressed to the operator: a gate wanting a yes or no, a
+ * question wanting an answer, and a message the operator wrote that has not been read
+ * yet. They share a shape on purpose — full-width, framed, amber while unresolved — so
+ * that "something wants me" is one visual fact whether it appears in a job's stream or
+ * on the Attention screen with four others.
+ */
 
-/* A gate is the one thing in the app that is addressed to the operator, so it gets
-   the strongest frame in the app — a full amber left edge while it waits. */
+/* A gate gets the strongest frame in the app: a full amber left edge while it waits. */
 .gate {
   display: flex;
   flex-direction: column;
@@ -2215,20 +2831,41 @@ a.pill:hover {
   gap: 12px;
 }
 
+/* The icon is what makes a gate recognisable before a word of it is read, which is the
+   whole point on a screen holding five of them. */
+.gate-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.gate-icon {
+  display: inline-flex;
+  flex: none;
+  margin-top: 2px;
+  padding: 4px;
+  border-radius: 50%;
+  background: rgb(237 179 85 / 14%);
+  color: var(--warn);
+}
+
+.gate-approved .gate-icon {
+  background: rgb(134 217 155 / 12%);
+  color: var(--good);
+}
+
+.gate-rejected .gate-icon {
+  background: rgb(255 125 114 / 12%);
+  color: var(--bad);
+}
+
 .gate-head h3 {
   font-family: var(--mono);
   font-size: 13px;
   font-weight: 500;
   line-height: 1.5;
   word-break: break-word;
-}
-
-.gate-head-side {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 6px;
-  flex: none;
 }
 
 .gate-meta {
@@ -2276,9 +2913,358 @@ a.pill:hover {
   border-color: var(--ink-4);
 }
 
+.gate-error {
+  color: var(--bad);
+  font-size: 12px;
+}
+
 .gate-outcome {
   color: var(--ink-3);
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1rem;
+  line-height: 1.45;
+}
+
+/* --------------------------------------------------------------- an agent asking */
+
+/*
+ * The piece that was missing. Faced with a decision only the operator could make, a
+ * model used to guess and then explain the guess three phases later.
+ *
+ * Shaped like a plan-mode prompt rather than a form: the question is the loudest line
+ * on the card, set in the serif because a person is being addressed; the options *are*
+ * the buttons; the free-text box is an escape hatch underneath rather than the path.
+ */
+.ask {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 15px 16px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--who);
+  border-radius: var(--r-lg);
+  background: var(--panel);
+}
+
+/* Unanswered, it is the operator's problem, so it takes the same amber as a gate. */
+.ask-pending {
+  border-left-color: var(--warn);
+  background: var(--raised);
+}
+
+.ask-answered {
+  border-left-color: var(--good);
+}
+
+.ask-cancelled,
+.ask-timeout {
+  border-left-color: var(--line-hard);
+  opacity: 0.78;
+}
+
+.ask-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.ask-who {
+  flex: 1;
+  min-width: 0;
+}
+
+.ask-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-4);
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+}
+
+.ask-agent {
+  color: var(--who);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.ask-verb {
+  color: var(--ink-3);
+  font-family: var(--serif);
+  font-stretch: normal;
+  font-style: italic;
+  font-size: 0.98rem;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.ask-badge {
+  display: inline-flex;
+  flex: none;
+  padding: 5px;
+  border-radius: 50%;
+  background: rgb(237 179 85 / 14%);
+  color: var(--warn);
+}
+
+/* The question itself. The largest serif in the app outside a heading, because it is
+   the one sentence on the screen that is waiting on a human. */
+.ask-question {
+  max-width: var(--measure);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 1.28rem;
+  line-height: 1.35;
+}
+
+.ask-detail {
+  max-width: var(--measure);
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.ask-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* One option, one click. Wide targets with the label first and the reasoning under it,
+   so the list can be read down the left edge without reading any of the detail. */
+.ask-option {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--void);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 120ms, background 120ms, transform 120ms;
+}
+
+.ask-option:hover:not(:disabled) {
+  border-color: var(--ink-4);
+  background: var(--hover);
+}
+
+.ask-option:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.ask-option:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.ask-option-label {
+  color: var(--ink);
+  font: 500 13.5px/1.4 var(--sans);
+}
+
+.ask-option-detail {
+  color: var(--ink-3);
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 0.98rem;
+  line-height: 1.4;
+}
+
+.ask-free {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.ask-free textarea {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--void);
+  color: var(--ink);
+  font: 400 13.5px/1.55 var(--sans);
+  resize: vertical;
+}
+
+.ask-free textarea:focus {
+  outline: none;
+  border-color: var(--ink-4);
+}
+
+.ask-free textarea::placeholder {
+  color: var(--ink-4);
+}
+
+.ask-error {
+  color: var(--bad);
   font-size: 12px;
+}
+
+.ask-outcome {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.ask-outcome-kind {
+  color: var(--ink-4);
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* What the operator answered, in the operator's voice: serif, quoted, full ink. */
+.ask-answer {
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 1.08rem;
+  line-height: 1.4;
+}
+
+.ask-when {
+  margin-left: auto;
+  color: var(--ink-4);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------- a message not yet delivered */
+
+/*
+ * The window between typing a message and the team reading it used to be invisible and
+ * one-way. It is a thing on screen now, with all four verbs on it — reword it, send it
+ * now, put it back to the boundary, or withdraw it.
+ */
+.queued {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px 13px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-hard);
+  border-radius: var(--r-lg);
+  /* The operator wrote it, so it sits on the operator's ground. */
+  background: var(--paper);
+}
+
+/* Interrupting: it lands in the running agent's very next turn. */
+.queued-now {
+  border-left-color: var(--busy);
+}
+
+.queued-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.queued-when {
+  margin-left: auto;
+  color: var(--ink-4);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.queued-body {
+  max-width: var(--measure);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 1.1rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.queued-edit {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line-hard);
+  border-radius: var(--r);
+  background: var(--void);
+  color: var(--ink);
+  font: 400 14px/1.5 var(--serif);
+  resize: vertical;
+}
+
+.queued-edit:focus {
+  outline: none;
+  border-color: var(--ink-4);
+}
+
+.queued-error {
+  color: var(--bad);
+  font-size: 12px;
+}
+
+.queued-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.queued-list {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.queued-panel {
+  gap: 12px;
+}
+
+/* -------------------------------------------------------------------- attention */
+
+/*
+ * Everything waiting on the operator, across every job. Gates and questions interleave
+ * into one queue, oldest first, because the *kind* of wait is not what decides which one
+ * matters — how long it has been parked is.
+ */
+.attention {
+  max-width: 980px;
+}
+
+.waits {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+
+/* Which job is asking. Underlined rather than coloured: it is the one link on a card
+   whose other colours all mean something. */
+.wait-job {
+  color: var(--ink);
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1rem;
+  text-decoration: underline;
+  text-decoration-color: var(--line-hard);
+  text-underline-offset: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 34ch;
+  transition: text-decoration-color 120ms;
+}
+
+.wait-job:hover {
+  text-decoration-color: var(--ink);
 }
 
 /* ---------------------------------------------------------------------- drawer */
@@ -2520,6 +3506,132 @@ a.pill:hover {
   border-top: 1px solid var(--line);
 }
 
+/* --------------------------------------------------------------- command palette */
+
+/*
+ * Cmd+K. The rail has three destinations and a job has a dozen actions, and the ones
+ * wanted in a hurry — stop that job, jump to the one that is asking a question — are
+ * the furthest from the pointer. One flat list, a substring match, a fixed order: the
+ * same keystrokes always select the same thing.
+ */
+.palette-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  justify-content: center;
+  padding: 11vh 16px 16px;
+  background: rgb(4 4 5 / 62%);
+  backdrop-filter: blur(3px);
+}
+
+.palette {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 560px;
+  max-height: min(64vh, 520px);
+  border: 1px solid var(--line-hard);
+  border-radius: var(--r-lg);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.palette-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-4);
+}
+
+.palette-field input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--ink);
+  font: 400 15px/1.4 var(--sans);
+}
+
+.palette-field input:focus {
+  outline: none;
+}
+
+.palette-field input::placeholder {
+  color: var(--ink-4);
+}
+
+.palette-field kbd {
+  flex: none;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--ink-4);
+  font: 500 10.5px/1.5 var(--mono);
+}
+
+.palette-error {
+  padding: 9px 13px;
+  color: var(--bad);
+  font-size: 12px;
+}
+
+.palette-none {
+  padding: 18px 14px;
+  color: var(--ink-3);
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1.04rem;
+}
+
+.palette-list {
+  padding: 5px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 9px;
+  border: none;
+  border-radius: var(--r);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* Keyboard selection, so it has to be visible without a pointer anywhere near it. */
+.palette-item.on {
+  background: var(--line);
+}
+
+.palette-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 400 13.5px/1.4 var(--sans);
+}
+
+.palette-hint {
+  flex: none;
+  color: var(--ink-4);
+  font-family: var(--sans);
+  font-stretch: var(--cond);
+  font-size: 11.5px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
 /* ------------------------------------------------- per-agent assignment table */
 
 .agent-assign {
@@ -2605,6 +3717,14 @@ a.pill:hover {
 .models-table input.mono {
   font-family: var(--mono);
   font-size: 11.5px;
+}
+
+/* USD per million tokens. Narrow, right-aligned and tabular, so a column of prices
+   reads as a column of figures rather than as four more text fields. */
+.price {
+  max-width: 92px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 .assign-table select {
@@ -2893,13 +4013,24 @@ a.pill:hover {
   white-space: nowrap;
 }
 
-/* ------------------------------------------------------------------- desktop */
+/* ------------------------------------------------------------------ the shape */
+
+/*
+ * Three widths, and each one changes exactly one thing about the shape.
+ *
+ *   860px — stacks become rows: the jobs list, and the console's head.
+ *   900px — the dock stands up into a rail, and the console stops flowing. From here
+ *           the app is one screen tall and the stream is the only thing that scrolls,
+ *           which is what makes a job read like a session rather than a long page.
+ *  1180px — the inspector stops being somewhere you go and becomes a rail beside the
+ *           stream, so the plan stays visible while the work moves.
+ *
+ * Nothing here reflows a component into a different component. The rail is the same
+ * five links, the console is the same head-stream-composer, the inspector is the same
+ * five panels. Only where they sit changes.
+ */
 
 @media (min-width: 860px) {
-  .content {
-    padding: 24px 24px 80px;
-  }
-
   .job-row {
     grid-template-columns: minmax(0, 1fr) 190px 230px;
     align-items: center;
@@ -2910,84 +4041,69 @@ a.pill:hover {
     justify-content: flex-end;
   }
 
-  .job-head {
-    flex-direction: row;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 28px;
+  /* What the job is, on the left; how it is going and what you can do about it, on
+     the right. The gauge gets a fixed column so the progress bar is the same length
+     on every job — a bar that changes width with the length of the task above it is
+     not a gauge, it is decoration. */
+  .console-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 196px auto;
+    align-items: start;
+    gap: 24px;
   }
 
-  .job-head-main {
-    min-width: 0;
-    flex: 1;
+  .console-gauge {
+    padding-top: 4px;
   }
 
-  .job-head-side {
-    align-items: flex-end;
-    flex: none;
-  }
-
-  .job-head-status,
-  .job-controls {
+  .console-verbs {
     justify-content: flex-end;
   }
 }
 
-/*
- * The rail. Same DOM as the top bar — `.topbar` is a flex container with three
- * children, so turning it into a column gives a vertical rail without React
- * knowing anything about it. Worth the two media queries: on a wide screen a
- * horizontal bar wastes the one axis that is scarce, and the nav ends up as far
- * from the content as it can get.
- */
-@media (min-width: 1100px) {
-  #root {
+@media (min-width: 900px) {
+  .app {
     grid-template-columns: var(--rail) minmax(0, 1fr);
-    grid-template-rows: minmax(100vh, auto);
+    grid-template-rows: minmax(0, 1fr);
   }
 
-  .topbar {
-    position: sticky;
-    top: 0;
-    align-self: start;
-    height: 100vh;
+  /* The dock stands up. Same element, same DOM order, same five links — the grid
+     moves it from row 2 to column 1 and the flex direction turns. */
+  .rail {
+    grid-row: 1;
+    grid-column: 1;
     flex-direction: column;
-    align-items: stretch;
-    gap: 22px;
-    padding: 20px 16px;
-    border-bottom: none;
-    border-right: 1px solid var(--line);
-    backdrop-filter: none;
-    background: rgb(13 13 15 / 70%);
-  }
-
-  .brand {
-    padding: 0 6px;
-  }
-
-  .brand-text {
-    font-size: 1.42rem;
-  }
-
-  .nav {
-    flex-direction: column;
-    align-items: stretch;
     gap: 1px;
-    margin-left: 0;
+    padding: 18px 12px;
+    padding-bottom: max(18px, env(safe-area-inset-bottom));
+    border-top: none;
+    border-right: 1px solid var(--line);
+    background: rgb(13 13 15 / 70%);
+    backdrop-filter: none;
+    overflow-y: auto;
   }
 
-  .nav-link {
+  .rail-brand {
+    display: flex;
+    padding: 0 8px 20px;
+  }
+
+  .rail-link {
+    flex: none;
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 10px;
     padding: 8px 10px;
-    font-size: 13.5px;
+    text-align: left;
   }
 
-  .nav-link.active {
+  .rail-link.active {
     background: var(--line-soft);
   }
 
-  /* In a column the underline tick becomes a left mark, which reads correctly for
-     a vertical list where a bottom rule would look like a separator. */
-  .nav-link.active::after {
+  /* In a column the tick belongs on the rail's left edge. Along the top it would read
+     as a rule between two links rather than as a mark on one. */
+  .rail-link.active::after {
     left: 0;
     right: auto;
     top: 7px;
@@ -2996,60 +4112,119 @@ a.pill:hover {
     height: auto;
   }
 
-  .nav-count {
+  /* Room for a word at full width, so the label stops being a caption under an icon
+     and becomes the thing you are reading. */
+  .rail-text {
+    font-stretch: normal;
+    font-size: 13.5px;
+    letter-spacing: 0;
+  }
+
+  /* Beside the word, where a figure reads as a count. Riding the icon it had to be a
+     badge; here it can just be a number in the warn tone. */
+  .rail-count {
+    position: static;
+    margin-left: auto;
+    min-width: 0;
+    height: auto;
+    padding: 0;
+    background: transparent;
+    color: var(--warn);
+    font: 600 11.5px/1.4 var(--mono);
+  }
+
+  .rail-key {
+    display: inline-block;
     margin-left: auto;
   }
 
-  .topbar-right {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 12px;
-    margin-left: 0;
-    margin-top: auto;
-    padding-top: 16px;
+  /* Three destinations at the top; Find, New job and the health line at the bottom.
+     The gap is what separates going somewhere from doing something. */
+  .rail-gap {
+    display: block;
+    flex: 1;
+    min-height: 14px;
+  }
+
+  /* Still silent when the service is fine — but when it does have something to say,
+     the rail has room for it to say it in words. */
+  .rail-health:not(.health-ok) {
+    align-self: stretch;
+    margin-top: 12px;
+    padding: 11px 10px 0;
     border-top: 1px solid var(--line-soft);
   }
 
-  .health {
-    padding: 0 6px;
+  .stage {
+    grid-row: 1;
+    grid-column: 2;
+    padding: 22px 26px 26px;
   }
 
-  .content {
-    padding: 28px 32px 90px;
+  /*
+   * The console stops flowing and starts fitting. It is exactly as tall as the stage,
+   * the head and the composer are fixed at either end, and the stream in between is
+   * the only thing that scrolls. That is the difference between reading a transcript
+   * and watching a session: the composer never leaves, and where you are in the
+   * stream is not where the page happens to be scrolled to.
+   */
+  .console {
+    height: 100%;
   }
 
-  .transcript {
-    max-height: min(66vh, 760px);
+  .console-body,
+  .console-main,
+  .inspector,
+  .stream-wrap {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .stream {
+    flex: 1;
+    max-height: none;
+  }
+}
+
+@media (min-width: 1180px) {
+  .console-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) var(--inspector);
+    gap: 24px;
+  }
+
+  /* Both halves are on screen at once, so the swap the narrow layout depends on is
+     switched off rather than argued with. `data-inspecting` still tracks the route —
+     it just stops meaning "instead of". */
+  .console[data-inspecting="true"] .console-main,
+  .console[data-inspecting="false"] .inspector {
+    display: flex;
+  }
+
+  .inspector {
+    padding-left: 22px;
+    border-left: 1px solid var(--line);
+  }
+
+  /* The rail is not covering anything, so the tabs can wrap instead of scrolling
+     sideways past the edge. */
+  .inspector-tabs {
+    flex-wrap: wrap;
+    overflow-x: visible;
+  }
+
+  /* Nothing to close, and nothing to open: it is already beside you. */
+  .inspector-close,
+  .console-inspect {
+    display: none;
   }
 }
 
 /* -------------------------------------------------------------------- narrow */
 
 @media (max-width: 640px) {
-  .topbar {
-    flex-wrap: wrap;
-    padding: 8px 12px;
-    padding-top: max(8px, env(safe-area-inset-top));
-  }
-
-  .brand-text {
-    display: none;
-  }
-
-  .nav {
-    order: 3;
-    width: 100%;
-    margin-left: 0;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  .nav::-webkit-scrollbar {
-    display: none;
-  }
-
-  .content {
-    padding: 14px 12px 60px;
+  .stage {
+    padding: 12px 11px 18px;
   }
 
   .screen {
@@ -3073,12 +4248,8 @@ a.pill:hover {
     font-size: 10.5px;
   }
 
-  .job-title {
-    font-size: 1.4rem;
-  }
-
-  .job-head-side {
-    min-width: 0;
+  .console-title h1 {
+    font-size: 1.34rem;
   }
 
   .field-row {
@@ -3100,61 +4271,71 @@ a.pill:hover {
     grid-column: 1 / -1;
   }
 
-  /* Nine tabs do not fit on one 390px line, and the strip hides its own scrollbar,
-     so the sideways scroll that made them "reachable" was invisible: Agents,
-     Artifacts and Approvals simply looked absent. Wrap to more rows instead —
-     nothing hidden, no affordance to guess at. */
-  .tabs {
+  /* Five panels do not fit on one 390px line, and a strip that hides its own
+     scrollbar hides the fact that there is more of it — which is exactly what went
+     wrong with the nine tabs this replaced. Wrap: nothing hidden, nothing to guess. */
+  .inspector-tabs {
     flex-wrap: wrap;
     overflow-x: visible;
     gap: 0 2px;
   }
 
-  .tab {
-    padding: 8px 9px;
-    font-size: 12.5px;
-  }
-
-  .turn-note,
-  .turn-command {
+  /* The indents that give the stream its left margin on a wide screen are most of the
+     line at this width, so they go and the stream reads flush. */
+  .jot {
     padding-left: 0;
   }
 
-  .turn-command {
+  .say {
+    padding: 11px 12px;
+  }
+
+  /* A long command and its exit code will not share a 390px line, so the meta drops
+     under the command rather than squeezing it to two characters. */
+  .cmd-head {
     flex-wrap: wrap;
   }
 
-  .composer-row {
+  .cmd-line {
+    flex: 1 1 100%;
+  }
+
+  .cmd-sub,
+  .cmd-output {
+    padding-left: 12px;
+  }
+
+  .ask-question {
+    font-size: 1.16rem;
+  }
+
+  /* When and whether stack, and the two of them go full width: on a phone the choice
+     between "at the next boundary" and "right now" is worth a whole line. */
+  .composer-side {
     flex-direction: column;
     align-items: stretch;
+    gap: 9px;
+  }
+
+  .composer-when {
+    align-self: stretch;
+  }
+
+  .when {
+    flex: 1;
+    text-align: center;
   }
 
   .composer-actions {
-    flex-direction: row;
+    margin-left: 0;
   }
 
   .composer-actions .button {
     flex: 1;
   }
 
-  /* A long command plus its status pill will not share a 390px line, so the meta
-     drops under the command rather than squeezing it to two characters. */
-  .command-head {
-    flex-wrap: wrap;
-  }
-
-  .command-line {
-    flex: 1 1 100%;
-  }
-
-  .command-sub,
-  .command-output {
-    padding-left: 12px;
-  }
-
-  .phase-acceptance,
-  .phase-output {
-    padding-left: 0;
+  .queued-actions .button {
+    flex: 1;
   }
 
   /* A side panel has nowhere to go at this width, so it becomes a bottom sheet. */
@@ -3198,15 +4379,16 @@ a.pill:hover {
     border-bottom: none;
   }
 
+  /* The palette is the only overlay that stays a card: it is a text field, and a
+     full-height sheet for one line of typing would be theatre. */
+  .palette-veil {
+    padding: 8vh 10px 10px;
+  }
+
   .gate-head,
   .gate-actions {
     flex-direction: column;
     align-items: stretch;
-  }
-
-  .gate-head-side {
-    flex-direction: row;
-    align-items: center;
   }
 
   .role {
@@ -3263,6 +4445,11 @@ a.pill:hover {
 
   .usage-table td::before {
     content: attr(data-label);
+  }
+
+  .price {
+    max-width: none;
+    text-align: left;
   }
 
   .usage-bar {

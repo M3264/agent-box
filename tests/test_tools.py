@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import json
 import signal
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -35,12 +34,12 @@ from app.config import settings
 from app.db import db
 from app.deps import engine
 from app.orchestrator import agentloop as agentloop_mod
-from app.orchestrator import engine as engine_mod
 from app.orchestrator import sandbox as sandbox_mod
 from app.orchestrator import tools as tools_mod
 from app.orchestrator.sandbox import Completed, DirectSandbox, SandboxStatus
 from app.orchestrator.tools import ToolInvocation, classify
 from tests.conftest import (
+    ONE_PHASE,
     FakeProvider,
     envelope,
     event_kinds,
@@ -48,46 +47,16 @@ from tests.conftest import (
     says,
     tool,
     tools_turn,
+    tune,
     wait_for_approval,
     wait_for_job,
     wait_until,
 )
 
-#: One work phase keeps a script aligned with the turns it describes: the planning
-#: and synthesis calls are offered no tools, so they never consume a scripted turn.
-ONE_PHASE = {
-    "phases": [
-        {
-            "name": "Do the work",
-            "owner": "coder",
-            "acceptance": "the commands ran and their output was read",
-            "requires_approval": False,
-        }
-    ],
-    "notes": "one phase, so the script and the turns line up",
-}
-
-#: Every module that imported `settings` by value and reads a tool limit from it.
-_SETTINGS_READERS = (agentloop_mod, tools_mod, sandbox_mod, engine_mod)
-
 
 @pytest.fixture
 def provider() -> FakeProvider:
     return FakeProvider(plan=ONE_PHASE)
-
-
-def tune(monkeypatch: pytest.MonkeyPatch, **changes: Any) -> Any:
-    """Override the frozen settings everywhere they were imported.
-
-    `Settings` is a frozen dataclass built from the environment at import time and
-    each module holds its own reference, so a test can neither mutate it nor patch a
-    single place. `replace` builds a new one from the current values — no environment
-    is re-read — and every reader is repointed at it for the duration of the test.
-    """
-    tweaked = replace(settings, **changes)
-    for module in _SETTINGS_READERS:
-        monkeypatch.setattr(module, "settings", tweaked)
-    return tweaked
 
 
 async def tool_rows(job_id: str) -> list[dict[str, Any]]:

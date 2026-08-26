@@ -16,13 +16,19 @@ from app.logging_setup import get_logger
 from app.models import (
     TERMINAL_JOB_STATUSES,
     AgentAssignment,
+    BudgetUpdate,
     JobAction,
     JobContinue,
     JobCreate,
     JobRerun,
     MessageCreate,
+    MessageUpdate,
+    QuestionAnswer,
 )
 from app.orchestrator.engine import Assignment, resolve_choice
+from app.orchestrator.questions import answer as answer_question
+from app.orchestrator.questions import cancel_open as cancel_questions
+from app.orchestrator.questions import for_job as questions_for_job
 from app.orchestrator.roles import Team, load_team, resolve_team_id
 from app.orchestrator.sandbox import status as sandbox_status
 from app.orchestrator.usage import job_usage
@@ -179,6 +185,7 @@ async def _spawn_job(
     provider_id: str | None,
     sandbox: str | None,
     agents: list[AgentAssignment],
+    token_budget: int | None = None,
     forked_from: str | None = None,
 ) -> dict[str, Any]:
     """Create a job, seed its planning phase, and start it.
@@ -213,8 +220,8 @@ async def _spawn_job(
     async with db.transaction() as conn:
         await conn.execute(
             "insert into jobs(id,task,team_id,provider_id,mode,status,paused,workspace,"
-            "sandbox,forked_from,rounds,created_at,updated_at)"
-            " values(?,?,?,?,?,'queued',0,?,?,?,1,unixepoch('subsec'),unixepoch('subsec'))",
+            "sandbox,token_budget,forked_from,rounds,created_at,updated_at)"
+            " values(?,?,?,?,?,'queued',0,?,?,?,?,1,unixepoch('subsec'),unixepoch('subsec'))",
             (
                 job_id,
                 task,
@@ -223,6 +230,10 @@ async def _spawn_job(
                 mode,
                 str(workspace),
                 sandbox,
+                # 0 is a deliberate "no cap", distinct from None, which is "whatever the
+                # server default is at the moment the job runs" — so it is stored as
+                # null and resolved later, exactly like the sandbox above.
+                token_budget,
                 forked_from,
             ),
         )
@@ -256,6 +267,7 @@ async def _spawn_job(
         "mode": mode,
         "team_id": resolved_team,
         "sandbox": sandbox,
+        "token_budget": token_budget,
         "provider_id": provider_id,
         "forked_from": forked_from,
     }
@@ -269,6 +281,7 @@ async def create_job(payload: JobCreate) -> dict[str, Any]:
         mode=payload.mode,
         provider_id=payload.provider_id,
         sandbox=payload.sandbox,
+        token_budget=payload.token_budget,
         agents=payload.agents,
     )
 
@@ -286,6 +299,11 @@ async def list_jobs(limit: Annotated[int, Query(ge=1, le=500)] = 100) -> list[di
         select j.*,
                (select count(*) from approvals a
                  where a.job_id=j.id and a.status='pending')          as pending_approvals,
+               (select count(*) from questions q
+                 where q.job_id=j.id and q.status='pending')          as pending_questions,
+               (select count(*) from job_messages m
+                 where m.job_id=j.id and m.consumed_at is null
+                   and m.cancelled_at is null)                        as pending_messages,
                (select count(*) from phases p where p.job_id=j.id)    as phase_total,
                (select count(*) from phases p
                  where p.job_id=j.id and p.status='complete')         as phase_complete,
@@ -306,7 +324,7 @@ async def get_job(job_id: JobId) -> dict[str, Any]:
     """
     job = _job_dict(await require_job(job_id))
 
-    phases, agents, artifacts, messages, gates, calls, history, usage, pinned = (
+    phases, agents, artifacts, messages, gates, calls, asks, history, usage, pinned = (
         await asyncio.gather(
             db.fetch_all("select * from phases where job_id=? order by seq", (job_id,)),
             db.fetch_all("select * from job_agents where job_id=? order by agent", (job_id,)),
@@ -319,6 +337,7 @@ async def get_job(job_id: JobId) -> dict[str, Any]:
                 f"select {TOOL_CALL_COLUMNS} from tool_calls where job_id=? order by created_at,rowid",
                 (job_id,),
             ),
+            questions_for_job(db, job_id),
             events.history(job_id, after=0, limit=2000),
             job_usage(db, job_id),
             db.fetch_all(
@@ -336,6 +355,7 @@ async def get_job(job_id: JobId) -> dict[str, Any]:
         "artifacts": [dict(row) for row in artifacts],
         "messages": [dict(row) for row in messages],
         "approvals": [dict(row) for row in gates],
+        "questions": asks,
         "tool_calls": [_tool_call_dict(row) for row in calls],
         "events": [event.to_dict() for event in history],
         "usage": usage,
@@ -469,14 +489,19 @@ async def post_message(job_id: JobId, payload: MessageCreate) -> dict[str, Any]:
         )
 
     message_id = await db.insert(
-        "insert into job_messages(job_id,agent,role,content,created_at)"
-        " values(?,?,'operator',?,unixepoch('subsec'))",
-        (job_id, payload.agent, payload.content),
+        "insert into job_messages(job_id,agent,role,content,delivery,created_at)"
+        " values(?,?,'operator',?,?,unixepoch('subsec'))",
+        (job_id, payload.agent, payload.content, payload.delivery),
     )
     await events.record(
         job_id,
         "message",
-        {"content": payload.content, "operator": True, "message_id": message_id},
+        {
+            "content": payload.content,
+            "operator": True,
+            "message_id": message_id,
+            "delivery": payload.delivery,
+        },
         source="operator",
     )
     return {
@@ -485,8 +510,139 @@ async def post_message(job_id: JobId, payload: MessageCreate) -> dict[str, Any]:
         "agent": payload.agent,
         "role": "operator",
         "content": payload.content,
+        "delivery": payload.delivery,
         "consumed_at": None,
+        "cancelled_at": None,
+        "updated_at": None,
     }
+
+
+async def _pending_message(job_id: str, message_id: int) -> Any:
+    """A message that can still be changed, or a 404/409 explaining why not.
+
+    409 rather than 404 once it has been delivered, because "too late" and "no such
+    message" are different things to see in a UI — the first means the team already
+    read it, and the operator's next move is to send a correction rather than hunt for
+    a bug.
+    """
+    row = await db.fetch_one(
+        "select * from job_messages where id=? and job_id=?", (message_id, job_id)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="message not found")
+    if row["role"] != "operator":
+        raise HTTPException(status_code=409, detail="only operator messages can be changed")
+    if row["cancelled_at"] is not None:
+        raise HTTPException(status_code=409, detail="message was already cancelled")
+    if row["consumed_at"] is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="the team has already read this message; send another to correct it",
+        )
+    return row
+
+
+@router.patch("/{job_id}/messages/{message_id}")
+async def update_message(
+    job_id: JobId, message_id: Annotated[int, Path(ge=1)], payload: MessageUpdate
+) -> dict[str, Any]:
+    """Edit a queued message, or change when it will be delivered.
+
+    Both halves of "actually, I meant…" — a queued message used to be immutable, so a
+    typo could only be followed by a second message contradicting the first, which is
+    exactly the kind of thing a model resolves badly. Switching ``delivery`` to
+    ``immediate`` is the "send it now" action: the running phase picks it up at its
+    next turn rather than at the next boundary.
+    """
+    await require_job(job_id)
+    row = await _pending_message(job_id, message_id)
+
+    content = payload.content if payload.content is not None else str(row["content"])
+    delivery = payload.delivery or str(row["delivery"] or "boundary")
+    await db.execute(
+        "update job_messages set content=?,delivery=?,updated_at=unixepoch('subsec')"
+        " where id=? and consumed_at is null and cancelled_at is null",
+        (content, delivery, message_id),
+    )
+    await events.record(
+        job_id,
+        "message",
+        {
+            "content": content,
+            "operator": True,
+            "message_id": message_id,
+            "delivery": delivery,
+            "action": "expedited" if payload.content is None else "edited",
+        },
+        source="operator",
+    )
+    return {**dict(row), "content": content, "delivery": delivery}
+
+
+@router.delete("/{job_id}/messages/{message_id}")
+async def cancel_message(
+    job_id: JobId, message_id: Annotated[int, Path(ge=1)]
+) -> dict[str, Any]:
+    """Withdraw a message the team has not read yet.
+
+    Cancelled rather than deleted: the transcript should still show that something was
+    typed and taken back, which is a real event in the supervision of a job, and a row
+    that vanishes makes the stream lie about what happened.
+    """
+    await require_job(job_id)
+    row = await _pending_message(job_id, message_id)
+    await db.execute(
+        "update job_messages set cancelled_at=unixepoch('subsec')"
+        " where id=? and consumed_at is null and cancelled_at is null",
+        (message_id,),
+    )
+    await events.record(
+        job_id,
+        "message",
+        {
+            "content": str(row["content"]),
+            "operator": True,
+            "message_id": message_id,
+            "action": "cancelled",
+        },
+        source="operator",
+    )
+    return {**dict(row), "cancelled": True}
+
+
+# ------------------------------------------------------------------------- questions
+
+
+@router.get("/{job_id}/questions")
+async def get_questions(job_id: JobId) -> list[dict[str, Any]]:
+    await require_job(job_id)
+    return await questions_for_job(db, job_id)
+
+
+@router.post("/{job_id}/questions/{question_id}/answer")
+async def answer_job_question(
+    job_id: JobId,
+    question_id: Annotated[str, Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")],
+    payload: QuestionAnswer,
+) -> dict[str, Any]:
+    """Answer an agent's question and let its phase carry on.
+
+    409 when the question is no longer pending, which is the case worth being explicit
+    about: it may have timed out, or the job may have been stopped, and either way the
+    answer would go nowhere. The operator should see that rather than watch a job that
+    never moves.
+    """
+    await require_job(job_id)
+    row = await answer_question(
+        db, events, job_id=job_id, question_id=question_id, text=payload.text,
+        chosen=payload.chosen,
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=409,
+            detail="that question is not open for an answer (already answered, cancelled, or timed out)",
+        )
+    return row
 
 
 # --------------------------------------------------------------------- continuation
@@ -604,6 +760,11 @@ async def rerun_job(job_id: JobId, payload: JobRerun) -> dict[str, Any]:
             payload.provider_id if "provider_id" in payload.model_fields_set else job["provider_id"]
         ),
         sandbox=payload.sandbox if "sandbox" in payload.model_fields_set else job["sandbox"],
+        token_budget=(
+            payload.token_budget
+            if "token_budget" in payload.model_fields_set
+            else job["token_budget"]
+        ),
         agents=agents,
         forked_from=job_id,
     )
@@ -624,6 +785,36 @@ async def get_usage(job_id: JobId) -> dict[str, Any]:
     four thousand.
     """
     await require_job(job_id)
+    return await job_usage(db, job_id)
+
+
+@router.patch("/{job_id}/budget")
+async def set_budget(job_id: JobId, payload: BudgetUpdate) -> dict[str, Any]:
+    """Raise, lower, or remove this job's token cap.
+
+    A running job picks the new cap up on its next provider call, because the meter that
+    enforces it is re-read from this row each round — lowering it below what has already
+    been spent therefore stops the job at its next call rather than retroactively, which
+    is the only thing it could honestly do.
+    """
+    await require_job(job_id)
+    await db.execute(
+        "update jobs set token_budget=?,updated_at=unixepoch('subsec') where id=?",
+        (payload.token_budget, job_id),
+    )
+    await events.record(
+        job_id,
+        "notice",
+        {
+            "message": (
+                f"Token budget set to {payload.token_budget:,}."
+                if payload.token_budget
+                else "Token budget removed."
+            ),
+            "budget": True,
+        },
+        source="operator",
+    )
     return await job_usage(db, job_id)
 
 
@@ -686,6 +877,9 @@ async def stop_job(job_id: JobId) -> JobAction:
         "decision_note='job stopped' where job_id=? and status='pending'",
         (job_id,),
     )
+    # Same for an open question: the agent that asked it is gone, so leaving it in the
+    # inbox would invite an answer nothing will ever read.
+    await cancel_questions(db, events, job_id=job_id, reason="The job was stopped.")
     # A command that was in flight died with the task that spawned it, so the row must
     # say so. Left as 'running' the Commands view would claim a stopped job is still
     # executing something, and the startup sweep deliberately skips terminal jobs, so

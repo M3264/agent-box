@@ -26,13 +26,13 @@ def main(job_id: str) -> int:
 
         shots = {
             "list": f"{BASE}/#/jobs",
-            "job": f"{BASE}/#/jobs/{job_id}",
-            "result": f"{BASE}/#/jobs/{job_id}/result",
-            "usage": f"{BASE}/#/jobs/{job_id}/usage",
+            "console": f"{BASE}/#/jobs/{job_id}",
             "plan": f"{BASE}/#/jobs/{job_id}/plan",
-            "commands": f"{BASE}/#/jobs/{job_id}/commands",
+            "agents": f"{BASE}/#/jobs/{job_id}/agents",
+            "tokens": f"{BASE}/#/jobs/{job_id}/tokens",
+            "events": f"{BASE}/#/jobs/{job_id}/events",
+            "attention": f"{BASE}/#/attention",
             "settings": f"{BASE}/#/settings",
-            "inbox": f"{BASE}/#/approvals",
         }
         for name, url in shots.items():
             page.goto(url, wait_until="networkidle")

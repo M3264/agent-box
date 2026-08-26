@@ -36,6 +36,13 @@ function gist(event: JobEvent): string {
       return `${Array.isArray(payload.messages) ? payload.messages.length : 0} operator messages`
     case 'tool_call':
       return `${value('display')} → ${value('status')}`
+    case 'question': {
+      const status = value('status')
+      const asked = value('question').slice(0, 120)
+      if (status === 'pending') return asked
+      const answer = value('answer') || value('chosen')
+      return answer ? `${status} · ${answer.slice(0, 120)}` : status
+    }
     case 'notice':
       return value('message')
     case 'error':

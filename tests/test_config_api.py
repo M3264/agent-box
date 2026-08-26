@@ -139,10 +139,11 @@ async def test_delete_keeps_a_profile_that_history_depends_on(
 
 async def test_seeded_team_is_the_four_role_default(client: httpx.AsyncClient) -> None:
     teams = (await client.get("/api/teams")).json()
-    # Two seeded rows now: the original, and the v2 rewrite whose specialists are told
-    # they have a shell. Templates are append-only, so migration 002 adds a row and
-    # moves `is_default` rather than editing the instructions a finished job ran with.
-    assert len(teams) == 2
+    # Three seeded rows now: the original, the v2 rewrite whose specialists are told they
+    # have a shell, and the v3 rewrite that tells them they can ask the operator a
+    # question. Templates are append-only, so each migration adds a row and moves
+    # `is_default` rather than editing the instructions a finished job ran with.
+    assert len(teams) == 3
     defaults = [team for team in teams if team["is_default"]]
     assert len(defaults) == 1, "exactly one template may be the default"
     default = defaults[0]
@@ -150,11 +151,13 @@ async def test_seeded_team_is_the_four_role_default(client: httpx.AsyncClient) -
     assert [role["id"] for role in default["roles"]] == ["manager", "architect", "coder", "tester"]
     assert [role["id"] for role in default["roles"] if role["orchestrator"]] == ["manager"]
 
-    # The point of v2 is that the roles know they can act. A template that still reads
-    # like v1 would run the tools code and never use it.
+    # The point of v2 is that the roles know they can act, and of v3 that they know they
+    # can ask. A template that still reads like v1 would run the code and never use it.
     instructions = {role["id"]: role["instructions"] for role in default["roles"]}
     assert "write_file" in instructions["coder"]
     assert "Verify the work by executing it" in instructions["tester"]
+    assert "ask_operator" in instructions["architect"]
+    assert "ask_operator" in instructions["tester"]
 
     assert (await client.get(f"/api/teams/{default['id']}")).json() == default
     assert (await client.get("/api/teams/999")).status_code == 404

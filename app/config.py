@@ -105,6 +105,19 @@ class Settings:
     #: Seconds a single fetch may take.
     fetch_timeout: int = field(default_factory=lambda: _env_int("AGENT_HUB_FETCH_TIMEOUT", 30))
 
+    # -- asking the operator -------------------------------------------------
+    #: Seconds a question waits before the agent is told to proceed on its own
+    #: judgement. Unlike an approval, which waits forever because the operator
+    #: explicitly gated that action, a question is the agent's own initiative — and a
+    #: job hung overnight because nobody was watching is worse than one that carried
+    #: on and said which assumption it made. Set to 0 to wait indefinitely.
+    question_timeout: int = field(default_factory=lambda: _env_int("AGENT_HUB_QUESTION_TIMEOUT", 1800))
+    #: Default cap on total tokens for a job, across every round. 0 means no cap. A
+    #: job may still be created with its own budget, which wins.
+    token_budget_default: int = field(
+        default_factory=lambda: _env_int("AGENT_HUB_TOKEN_BUDGET", 0)
+    )
+
     def ensure_dirs(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.workspace_root.mkdir(parents=True, exist_ok=True)

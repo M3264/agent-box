@@ -14,15 +14,18 @@ Two ideas, and the split between them is the whole design:
   covers the tool loop's turns without the tool loop knowing this file exists.
 
 Accounting never fails a phase. A job whose ledger write breaks should still finish and
-report its work; the numbers are valuable, but they are not the work.
+report its work; the numbers are valuable, but they are not the work. The one exception
+is deliberate: a job with a token budget is *stopped* by this module when it exhausts it,
+which is the whole point of a budget as opposed to a report.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+from app.config import settings
 from app.db import Database
 from app.logging_setup import get_logger
 from app.orchestrator.providers import Completion, Message, Provider, normalize_usage
@@ -32,6 +35,32 @@ log = get_logger("agent_hub.usage")
 #: What a call was for. Free text in the column, but these are the values written.
 PURPOSES = ("plan", "work", "synthesis")
 
+#: Prices are quoted per million tokens, which is how every endpoint publishes them.
+PRICE_UNIT = 1_000_000
+
+
+class BudgetExceeded(Exception):
+    """Raised instead of making a provider call that would exceed the job's budget.
+
+    Raised by :class:`MeteredProvider`, which is the one place every call in the system
+    passes through — the planner, the specialists, each turn of the tool loop, and the
+    synthesis. Checking here rather than in the engine's phase loop is what makes the cap
+    mean something: a single phase can make a dozen calls, and a budget only enforced
+    between phases is a budget a runaway phase never notices.
+    """
+
+
+def resolve_budget(row_value: Any) -> int:
+    """The cap for a job: its own if it has one, otherwise the server default.
+
+    Null on the row means "whatever the default is when it runs", and 0 means "no cap" —
+    which is why this cannot be a simple ``or``: an explicit 0 must survive a non-zero
+    default.
+    """
+    if row_value is None:
+        return max(0, int(settings.token_budget_default))
+    return max(0, int(row_value))
+
 
 @dataclass(slots=True)
 class UsageMeter:
@@ -39,6 +68,21 @@ class UsageMeter:
 
     db: Database
     job_id: str
+    #: Total tokens this job may spend across every round. 0 means no cap.
+    budget: int = 0
+    #: What it has spent already, including previous rounds. Kept in step with the job
+    #: row on every write so the check below never needs a query of its own.
+    spent: int = field(default=0)
+
+    @property
+    def over_budget(self) -> bool:
+        return bool(self.budget) and self.spent >= self.budget
+
+    def budget_error(self) -> BudgetExceeded:
+        return BudgetExceeded(
+            f"token budget exhausted: {self.spent:,} of {self.budget:,} tokens used. "
+            "Raise the budget on the job to carry on."
+        )
 
     async def record(
         self,
@@ -102,6 +146,9 @@ class UsageMeter:
                 exc_info=True,
             )
 
+        # Counted even if the write above failed. The tokens were spent either way, and a
+        # broken ledger is not a reason to let a capped job keep spending.
+        self.spent += counts["total"]
         return counts
 
 
@@ -147,6 +194,22 @@ class MeteredProvider:
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> Completion:
+        # Checked before the call, not after: a cap that only notices once the money is
+        # spent is a receipt. The last call before a breach is therefore allowed to
+        # overshoot — the alternative would be predicting a response's token count, which
+        # nothing can do, and refusing calls on a guess would stop jobs that were fine.
+        if self._meter.over_budget:
+            log.info(
+                "refusing a provider call over budget",
+                extra={
+                    "job_id": self._meter.job_id,
+                    "spent": self._meter.spent,
+                    "budget": self._meter.budget,
+                    "agent": self._agent,
+                },
+            )
+            raise self._meter.budget_error()
+
         completion = await self._inner.complete(
             system=system,
             messages=messages,
@@ -165,6 +228,47 @@ class MeteredProvider:
         return completion
 
 
+async def model_prices(db: Database) -> dict[tuple[str, str], tuple[float | None, float | None]]:
+    """``(provider_id, model) -> (price_in, price_out)`` per million tokens.
+
+    Read at presentation time rather than stamped onto each ledger row at call time.
+    That is a deliberate trade: correcting a price re-prices history, which is the
+    behaviour you want from a tool whose real question is "what is this costing me" —
+    and the alternative, a frozen price per row, mostly preserves an old typo.
+    """
+    rows = await db.fetch_all(
+        "select provider_id, model, price_in, price_out from provider_models"
+        " where price_in is not null or price_out is not null"
+    )
+    return {
+        (str(row["provider_id"]), str(row["model"])): (row["price_in"], row["price_out"])
+        for row in rows
+    }
+
+
+def estimate_cost(
+    prompt: int, completion: int, price_in: float | None, price_out: float | None
+) -> float | None:
+    """Cost of one bucket of tokens, or None when the model has no price on file.
+
+    Unknown is not zero. A model nobody has priced must read as unpriced in the UI,
+    because folding it in at zero would quietly under-report the total — the one number
+    an operator is most likely to trust without checking.
+
+    Cached prompt tokens are billed at the input price here. Discounts for them vary per
+    endpoint and are not modelled, which makes this an over-estimate rather than an
+    under-estimate on providers that discount them — the safer direction to be wrong in.
+    """
+    if price_in is None and price_out is None:
+        return None
+    total = 0.0
+    if price_in is not None:
+        total += prompt * price_in / PRICE_UNIT
+    if price_out is not None:
+        total += completion * price_out / PRICE_UNIT
+    return round(total, 6)
+
+
 async def job_usage(db: Database, job_id: str) -> dict[str, Any]:
     """The usage summary the API puts on a job snapshot.
 
@@ -173,7 +277,8 @@ async def job_usage(db: Database, job_id: str) -> dict[str, Any]:
     where "which agent burned the budget" is actually answerable.
     """
     row = await db.fetch_one(
-        "select prompt_tokens,completion_tokens,total_tokens,provider_calls from jobs where id=?",
+        "select prompt_tokens,completion_tokens,total_tokens,provider_calls,token_budget"
+        " from jobs where id=?",
         (job_id,),
     )
     totals = {
@@ -199,19 +304,53 @@ async def job_usage(db: Database, job_id: str) -> dict[str, Any]:
         )
     ]
 
-    by_model = [
-        {
-            "provider_id": entry["provider_id"],
-            "model": entry["model"],
-            "calls": int(entry["calls"]),
-            "total": int(entry["total_tokens"]),
-        }
-        for entry in await db.fetch_all(
-            "select provider_id, model, count(*) as calls, sum(total_tokens) as total_tokens"
-            " from token_usage where job_id=? group by provider_id, model"
-            " order by total_tokens desc",
-            (job_id,),
+    prices = await model_prices(db)
+    by_model: list[dict[str, Any]] = []
+    cost = 0.0
+    priced_any = False
+    unpriced_tokens = 0
+    for entry in await db.fetch_all(
+        "select provider_id, model, count(*) as calls, sum(prompt_tokens) as prompt_tokens,"
+        " sum(completion_tokens) as completion_tokens, sum(total_tokens) as total_tokens"
+        " from token_usage where job_id=? group by provider_id, model"
+        " order by total_tokens desc",
+        (job_id,),
+    ):
+        prompt = int(entry["prompt_tokens"] or 0)
+        completion = int(entry["completion_tokens"] or 0)
+        price_in, price_out = prices.get(
+            (str(entry["provider_id"]), str(entry["model"])), (None, None)
         )
-    ]
+        estimate = estimate_cost(prompt, completion, price_in, price_out)
+        if estimate is None:
+            unpriced_tokens += int(entry["total_tokens"] or 0)
+        else:
+            priced_any = True
+            cost += estimate
+        by_model.append(
+            {
+                "provider_id": entry["provider_id"],
+                "model": entry["model"],
+                "calls": int(entry["calls"]),
+                "prompt": prompt,
+                "completion": completion,
+                "total": int(entry["total_tokens"] or 0),
+                "cost": estimate,
+            }
+        )
 
-    return {"totals": totals, "by_agent": by_agent, "by_model": by_model}
+    limit = resolve_budget(row["token_budget"] if row else None)
+    return {
+        "totals": totals,
+        "by_agent": by_agent,
+        "by_model": by_model,
+        # None rather than 0 when nothing is priced, so the UI can say "no prices on
+        # file" instead of claiming a job was free.
+        "cost": round(cost, 6) if priced_any else None,
+        "unpriced_tokens": unpriced_tokens,
+        "budget": {
+            "limit": limit,
+            "used": totals["total"],
+            "remaining": max(0, limit - totals["total"]) if limit else None,
+        },
+    }

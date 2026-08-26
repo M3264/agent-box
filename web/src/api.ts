@@ -11,6 +11,8 @@ import type {
   AgentProvider,
   Approval,
   ApprovalStatus,
+  Attention,
+  Delivery,
   DiscoveredModels,
   Health,
   InboxApproval,
@@ -24,6 +26,7 @@ import type {
   Provider,
   ProviderKind,
   ProviderTemplate,
+  Question,
   SandboxInfo,
   SandboxKind,
   Team,
@@ -96,6 +99,11 @@ const body = (payload: unknown): RequestInit => ({
   body: JSON.stringify(payload),
 })
 
+const patch = (payload: unknown): RequestInit => ({
+  method: 'PATCH',
+  body: JSON.stringify(payload),
+})
+
 export const api = {
   health: () => request<Health>('/api/health'),
 
@@ -107,16 +115,46 @@ export const api = {
     team_id?: number
     provider_id?: string | null
     sandbox?: SandboxKind | null
+    /** Total tokens this job may spend. 0 is an explicit "no cap". */
+    token_budget?: number | null
     /** Per-agent overrides. Omitted agents use the job's provider. */
     agents?: AgentProvider[]
   }) => request<{ id: string }>('/api/jobs', body(payload)),
 
   plan: (id: string) => request<Phase[]>(`/api/jobs/${id}/plan`),
   messages: (id: string) => request<JobMessage[]>(`/api/jobs/${id}/messages`),
-  sendMessage: (id: string, content: string) =>
-    request<JobMessage>(`/api/jobs/${id}/messages`, body({ content })),
+  sendMessage: (id: string, content: string, delivery: Delivery = 'boundary') =>
+    request<JobMessage>(`/api/jobs/${id}/messages`, body({ content, delivery })),
+  /**
+   * Change a queued message before the team reads it.
+   *
+   * Omitting `content` and setting `delivery: 'immediate'` is "send it now" — the same
+   * endpoint, because expediting a message *is* an edit of when it arrives, and two
+   * endpoints would let the two race each other.
+   */
+  editMessage: (
+    id: string,
+    messageId: number,
+    payload: { content?: string; delivery?: Delivery },
+  ) => request<JobMessage>(`/api/jobs/${id}/messages/${messageId}`, patch(payload)),
+  /** Withdraw it. The row stays in the log, stamped `cancelled_at`. */
+  cancelMessage: (id: string, messageId: number) =>
+    request<JobMessage & { cancelled: boolean }>(`/api/jobs/${id}/messages/${messageId}`, {
+      method: 'DELETE',
+    }),
+
+  questions: (id: string) => request<Question[]>(`/api/jobs/${id}/questions`),
+  /** Unblock an agent. Either a `chosen` option value, free text, or both. */
+  answerQuestion: (
+    id: string,
+    questionId: string,
+    payload: { chosen?: string; text?: string },
+  ) => request<Question>(`/api/jobs/${id}/questions/${questionId}/answer`, body(payload)),
 
   usage: (id: string) => request<JobUsage>(`/api/jobs/${id}/usage`),
+  /** Raise, lower or lift the cap. 0 means no cap; returns the whole ledger back. */
+  setBudget: (id: string, tokenBudget: number) =>
+    request<JobUsage>(`/api/jobs/${id}/budget`, patch({ token_budget: tokenBudget })),
   /** Another round on the same job: the conversation continues where it stopped. */
   continueJob: (id: string, instruction: string) =>
     request<{ id: string; status: string; round: number }>(
@@ -133,6 +171,7 @@ export const api = {
       provider_id?: string | null
       sandbox?: SandboxKind | null
       agents?: AgentProvider[]
+      token_budget?: number | null
     } = {},
   ) => request<{ id: string; forked_from: string }>(`/api/jobs/${id}/rerun`, body(payload)),
 
@@ -145,6 +184,14 @@ export const api = {
   pause: (id: string) => request<JobAction>(`/api/jobs/${id}/pause`, { method: 'POST' }),
   resume: (id: string) => request<JobAction>(`/api/jobs/${id}/resume`, { method: 'POST' }),
   stop: (id: string) => request<JobAction>(`/api/jobs/${id}/stop`, { method: 'POST' }),
+
+  /**
+   * Everything waiting on the operator, across every job.
+   *
+   * One request rather than three: the question "is anything waiting for me" is not
+   * per-kind, and three polls would let the badge disagree with itself.
+   */
+  attention: (limit = 200) => request<Attention>(`/api/attention?limit=${limit}`),
 
   inbox: (status: ApprovalStatus | 'all' = 'pending') =>
     request<InboxApproval[]>(`/api/approvals?status=${status}`),

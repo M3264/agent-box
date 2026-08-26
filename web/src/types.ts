@@ -24,6 +24,49 @@ export type SandboxKind = 'sandboxed' | 'unconfined'
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected'
 
 /**
+ * When a queued message reaches the team.
+ *
+ * `boundary` waits for the phase to end, so the team reads it between pieces of work.
+ * `immediate` is delivered to the running agent's next turn — which is what "send it
+ * now" means, and why the two are one field rather than two endpoints.
+ */
+export type Delivery = 'boundary' | 'immediate'
+
+export type QuestionStatus = 'pending' | 'answered' | 'cancelled' | 'timeout'
+
+/** One choice an agent offered. `value` is derived server-side and is stable. */
+export interface QuestionOption {
+  value: string
+  label: string
+  detail: string
+}
+
+/**
+ * An agent asking the operator something it cannot work out for itself.
+ *
+ * Distinct from an approval: an approval is a veto on an action already chosen, where
+ * the only answers are yes and no. This carries the agent's own options, or none, and
+ * the answer is prose the model reads.
+ */
+export interface Question {
+  id: string
+  job_id: string
+  phase_id: number | null
+  agent: string
+  question: string
+  detail: string | null
+  options: QuestionOption[]
+  allow_free_text: boolean
+  status: QuestionStatus
+  answer: string | null
+  chosen: string | null
+  created_at: number
+  answered_at: number | null
+  /** Present on the joined endpoints. Which phase is stuck is half the context. */
+  phase_name?: string | null
+}
+
+/**
  * How a command ended.
  *
  * `running` is not a transient UI state — it is what the database holds while the
@@ -101,6 +144,10 @@ export interface JobSummary {
   updated_at: number
   error: string | null
   pending_approvals: number
+  /** Open questions from the agents. Blocks the job exactly like a gate does. */
+  pending_questions: number
+  /** Queued operator messages the team has not read yet — editable until it does. */
+  pending_messages: number
   phase_total: number
   phase_complete: number
   artifact_count: number
@@ -109,6 +156,8 @@ export interface JobSummary {
   completion_tokens: number
   total_tokens: number
   provider_calls: number
+  /** The job's own token cap. Null means "the server default when it runs". */
+  token_budget: number | null
   /** How many rounds of work the operator has asked for. 1 for most jobs. */
   rounds: number
   /** The job this one was re-run from, if any. */
@@ -165,6 +214,18 @@ export interface JobMessage {
   content: string
   created_at: number
   consumed_at: number | null
+  /** When it reaches the team. Only meaningful while `consumed_at` is null. */
+  delivery: Delivery
+  /** Withdrawn by the operator before delivery. Kept in the log rather than deleted. */
+  cancelled_at: number | null
+  /** Last edit, so the UI can say so instead of silently showing different words. */
+  updated_at: number | null
+}
+
+/** A queued message joined to its job, as the cross-job inbox returns it. */
+export interface InboxMessage extends JobMessage {
+  job_task: string
+  job_status: JobStatus
 }
 
 export interface Approval {
@@ -192,6 +253,25 @@ export interface InboxApproval extends Approval {
   job_mode: Mode
 }
 
+/** A question joined to its job. */
+export interface InboxQuestion extends Question {
+  job_task: string
+  job_status: JobStatus
+}
+
+/**
+ * Everything waiting on the operator, across every job, oldest first.
+ *
+ * `counts.blocking` is what a badge shows: gates and questions, which hold work up. A
+ * queued message does not, so it is counted but deliberately kept out of that figure.
+ */
+export interface Attention {
+  approvals: InboxApproval[]
+  questions: InboxQuestion[]
+  messages: InboxMessage[]
+  counts: { approvals: number; questions: number; messages: number; blocking: number }
+}
+
 export interface JobEvent {
   id: number
   job_id: string
@@ -205,7 +285,22 @@ export interface JobEvent {
 export interface JobUsage {
   totals: { prompt: number; completion: number; total: number; calls: number }
   by_agent: { agent: string | null; calls: number; prompt: number; completion: number; total: number }[]
-  by_model: { provider_id: string | null; model: string | null; calls: number; total: number }[]
+  by_model: {
+    provider_id: string | null
+    model: string | null
+    calls: number
+    prompt: number
+    completion: number
+    total: number
+    /** Null when no price is on file for that model — not zero. */
+    cost: number | null
+  }[]
+  /** Estimated spend in USD, or null when nothing billed is priced. */
+  cost: number | null
+  /** Tokens that went through a model with no price, so the estimate excludes them. */
+  unpriced_tokens: number
+  /** The cap and how much of it is gone. `limit: 0` means no cap. */
+  budget: { limit: number; used: number; remaining: number | null }
 }
 
 /** One agent's pinned provider and model for a job. */
@@ -229,10 +324,16 @@ export interface JobSeed {
   team_id: number
   provider_id: string | null
   sandbox: SandboxKind | null
+  /** Null means the job carried no cap of its own and took the server's. */
+  token_budget: number | null
   agents: AgentProvider[]
 }
 
-export interface JobSnapshot extends Omit<JobSummary, 'pending_approvals' | 'phase_total' | 'phase_complete' | 'artifact_count'> {
+export interface JobSnapshot
+  extends Omit<
+    JobSummary,
+    'pending_approvals' | 'pending_questions' | 'pending_messages' | 'phase_total' | 'phase_complete' | 'artifact_count'
+  > {
   workspace: string | null
   /** Which confinement this job actually ran under; null when tools are off. */
   sandbox: SandboxKind | null
@@ -242,6 +343,7 @@ export interface JobSnapshot extends Omit<JobSummary, 'pending_approvals' | 'pha
   artifacts: Artifact[]
   messages: JobMessage[]
   approvals: Approval[]
+  questions: Question[]
   tool_calls: ToolCall[]
   events: JobEvent[]
   cursor: number
@@ -262,6 +364,10 @@ export interface ProviderModel {
   model: string
   label: string | null
   supports_tools: boolean
+  /** USD per million prompt tokens. Null means no estimate is possible. */
+  price_in: number | null
+  /** USD per million completion tokens. */
+  price_out: number | null
 }
 
 /**

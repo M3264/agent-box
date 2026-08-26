@@ -22,12 +22,18 @@ import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { ApiError, api } from '../api'
 import { Empty, ErrorNote, Spinner } from '../components/ui'
+import {
+  notificationsPossible,
+  notificationsWanted,
+  setNotificationsWanted,
+} from '../hooks/useAttention'
 import { usePoll } from '../hooks/usePoll'
 import { fullTime } from '../lib/format'
 import type {
   DiscoveredModels,
   Provider,
   ProviderKind,
+  ProviderModel,
   ProviderTemplate,
   Team,
   TeamRole,
@@ -37,6 +43,15 @@ interface ModelDraft {
   model: string
   label: string
   supports_tools: boolean
+  /**
+   * Prices are held as strings, not numbers.
+   *
+   * Empty has to mean "no price on file" rather than free, and a number input that
+   * round-trips through `Number('')` turns that into 0 — which would make the cost
+   * estimate confidently claim a job cost nothing.
+   */
+  price_in: string
+  price_out: string
 }
 
 interface ProviderDraft {
@@ -82,6 +97,8 @@ function toDraft(profile: Provider): ProviderDraft {
       model: entry.model,
       label: entry.label ?? '',
       supports_tools: entry.supports_tools,
+      price_in: entry.price_in === null ? '' : String(entry.price_in),
+      price_out: entry.price_out === null ? '' : String(entry.price_out),
     })),
     secret_ref: profile.secret_ref ?? '',
     headers: JSON.stringify(profile.headers, null, 2),
@@ -103,7 +120,13 @@ function fromTemplate(template: ProviderTemplate, current: ProviderDraft): Provi
     base_url: template.base_url,
     secret_ref: template.secret_ref ?? '',
     headers: JSON.stringify(template.headers, null, 2),
-    models: template.models.map((model) => ({ model, label: '', supports_tools: true })),
+    models: template.models.map((model) => ({
+      model,
+      label: '',
+      supports_tools: true,
+      price_in: '',
+      price_out: '',
+    })),
     model: template.models[0] ?? '',
   }
 }
@@ -114,14 +137,36 @@ function secretNote(profile: Provider): { text: string; tone: string } {
   return { text: `${profile.secret_ref} does not resolve`, tone: 'bad' }
 }
 
+/**
+ * A typed price cell: a number, `null` for "not priced", `undefined` for nonsense.
+ *
+ * Blank and zero are different answers and both are legitimate — a free model costs
+ * nothing, an unpriced one cannot be estimated at all — so this cannot collapse to a
+ * truthiness check.
+ */
+function price(raw: string): number | null | undefined {
+  const text = raw.trim()
+  if (text === '') return null
+  const value = Number(text)
+  return Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
 export function SettingsScreen() {
   const health = usePoll(api.health, 15_000)
 
   return (
     <section className="screen settings">
+      <header className="screen-head">
+        <div>
+          <p className="eyebrow">Configuration</p>
+          <h1>Settings</h1>
+        </div>
+      </header>
+
       <Providers />
       <Teams />
       <Tools />
+      <Notifications />
 
       <section className="panel">
         <header className="panel-head">
@@ -168,9 +213,78 @@ export function SettingsScreen() {
   )
 }
 
+/**
+ * Whether the browser should say something when a job parks.
+ *
+ * The permission prompt has to come from a click, which is the whole reason this is a
+ * switch on a settings screen rather than something the app asks for on load. Chrome
+ * ignores a request that did not follow a gesture, and a browser that has been told
+ * "block" once cannot be asked again from script at all — so the state is reported
+ * plainly instead of retried.
+ */
+function Notifications() {
+  const possible = notificationsPossible()
+  const [wanted, setWanted] = useState(notificationsWanted)
+  const [permission, setPermission] = useState<NotificationPermission | 'unsupported'>(
+    possible ? Notification.permission : 'unsupported',
+  )
+  const [asking, setAsking] = useState(false)
+
+  const toggle = async (on: boolean) => {
+    setNotificationsWanted(on)
+    setWanted(on)
+    if (!on || !possible || Notification.permission !== 'default') return
+    setAsking(true)
+    try {
+      setPermission(await Notification.requestPermission())
+    } finally {
+      setAsking(false)
+    }
+  }
+
+  const note = !possible
+    ? 'This browser has no notification API, so nothing will be sent.'
+    : permission === 'denied'
+      ? 'The browser is blocking notifications for this site. That has to be undone in its site settings — a page cannot ask again.'
+      : permission === 'granted'
+        ? wanted
+          ? 'Granted. A notification is sent when the number of blocked jobs rises and this tab is not in front.'
+          : 'Granted, but switched off here.'
+        : 'The browser will ask once you switch this on.'
+
+  return (
+    <section className="panel">
+      <header className="panel-head">
+        <h2>Tell me when a job stops</h2>
+        <span className={`pill pill-${wanted && permission === 'granted' ? 'good' : 'muted'}`}>
+          {wanted && permission === 'granted' ? 'on' : 'off'}
+        </span>
+      </header>
+
+      <p className="panel-note">
+        A job that parks itself on a question at two in the morning is invisible until
+        someone looks at this app. This is the only thing here that reaches out rather
+        than waiting to be read, so it fires on one signal only: the number of jobs
+        blocked on you going <em>up</em>, while you are looking at something else.
+      </p>
+
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={wanted}
+          disabled={!possible || asking || permission === 'denied'}
+          onChange={(event) => void toggle(event.target.checked)}
+        />
+        <span>Notify me when a job needs an answer</span>
+      </label>
+
+      <p className="field-note">{note}</p>
+    </section>
+  )
+}
+
 function Tools() {
   const { data, error, loading } = usePoll(api.sandbox, 30_000)
-
   if (error) {
     return (
       <section className="panel">
@@ -203,8 +317,8 @@ function Tools() {
 
       <p className="panel-note">
         Specialists can run shell commands, read and write files, and fetch URLs inside
-        their job&apos;s workspace. Every call is recorded in the job&apos;s Commands tab;
-        commands matching a guardrail wait for an approval in both modes.
+        their job&apos;s workspace. Every call appears inline in that job&apos;s stream with
+        its output; commands matching a guardrail wait for an approval in both modes.
       </p>
 
       <table className="table">
@@ -346,7 +460,13 @@ function Providers() {
       const have = new Set(current.models.map((entry) => entry.model))
       const added = names
         .filter((name) => !have.has(name))
-        .map((name) => ({ model: name, label: '', supports_tools: true }))
+        .map((name) => ({
+          model: name,
+          label: '',
+          supports_tools: true,
+          price_in: '',
+          price_out: '',
+        }))
       const models = [...current.models, ...added]
       return { ...current, models, model: current.model || (models[0]?.model ?? '') }
     })
@@ -387,13 +507,31 @@ function Providers() {
       return
     }
 
-    const models = draft.models
-      .map((entry) => ({
-        model: entry.model.trim(),
+    const models: ProviderModel[] = []
+    let unparseable = false
+    for (const entry of draft.models) {
+      const model = entry.model.trim()
+      if (model === '') continue
+      const priceIn = price(entry.price_in)
+      const priceOut = price(entry.price_out)
+      if (priceIn === undefined || priceOut === undefined) {
+        unparseable = true
+        continue
+      }
+      models.push({
+        model,
         label: entry.label.trim() || null,
         supports_tools: entry.supports_tools,
-      }))
-      .filter((entry) => entry.model !== '')
+        price_in: priceIn,
+        price_out: priceOut,
+      })
+    }
+
+    if (unparseable) {
+      setFormError('a price must be dollars per million tokens, or blank for "not priced"')
+      setBusy(false)
+      return
+    }
 
     if (models.length === 0) {
       // The server enforces this too, but a profile with no model saves cleanly and
@@ -567,6 +705,12 @@ function Providers() {
                     </th>
                     <th scope="col">Model id</th>
                     <th scope="col">Label (optional)</th>
+                    <th scope="col" className="right">
+                      $/Mtok in
+                    </th>
+                    <th scope="col" className="right">
+                      $/Mtok out
+                    </th>
                     <th scope="col">Tools</th>
                     <th scope="col" aria-label="Remove" />
                   </tr>
@@ -600,6 +744,26 @@ function Providers() {
                           aria-label={`Label for model ${index + 1}`}
                         />
                       </td>
+                      <td className="right">
+                        <input
+                          className="mono price"
+                          value={entry.price_in}
+                          onChange={(event) => patchModel(index, { price_in: event.target.value })}
+                          placeholder="—"
+                          inputMode="decimal"
+                          aria-label={`Prompt price for ${entry.model || `model ${index + 1}`}`}
+                        />
+                      </td>
+                      <td className="right">
+                        <input
+                          className="mono price"
+                          value={entry.price_out}
+                          onChange={(event) => patchModel(index, { price_out: event.target.value })}
+                          placeholder="—"
+                          inputMode="decimal"
+                          aria-label={`Completion price for ${entry.model || `model ${index + 1}`}`}
+                        />
+                      </td>
                       <td>
                         <label className="check tight">
                           <input
@@ -630,6 +794,13 @@ function Providers() {
                 </tbody>
               </table>
             )}
+
+            <p className="field-note">
+              Prices are dollars per million tokens, as the vendor lists them. Leave one
+              blank and this build will not guess: that model's tokens are reported as
+              unpriced rather than folded in at zero, so a cost estimate is never quietly
+              too low.
+            </p>
 
             <div className="models-foot">
               <button

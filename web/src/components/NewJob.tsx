@@ -51,6 +51,11 @@ export function NewJob({ open, onClose, seed }: Props) {
   const [providerId, setProviderId] = useState('')
   const [model, setModel] = useState('')
   const [sandbox, setSandbox] = useState<SandboxKind | ''>('')
+  /**
+   * Held as a string so blank can mean "the server's default cap" — which is a
+   * different statement from "no cap", and `Number('')` collapses the two into 0.
+   */
+  const [budget, setBudget] = useState('')
   const [assignments, setAssignments] = useState<Record<string, Assignment>>({})
   const [showAgents, setShowAgents] = useState(false)
   const [teams, setTeams] = useState<Team[]>([])
@@ -82,6 +87,7 @@ export function NewJob({ open, onClose, seed }: Props) {
     setTask('')
     setModel('')
     setSandbox('')
+    setBudget('')
     setAssignments({})
     setShowAgents(false)
     setError(null)
@@ -109,6 +115,7 @@ export function NewJob({ open, onClose, seed }: Props) {
     setTeamId(seed.team_id)
     setProviderId(seed.provider_id ?? '')
     setSandbox(seed.sandbox ?? '')
+    setBudget(seed.token_budget === null ? '' : String(seed.token_budget))
     const seeded: Record<string, Assignment> = {}
     for (const entry of seed.agents) {
       seeded[entry.agent] = { provider_id: entry.provider_id ?? '', model: entry.model ?? '' }
@@ -185,6 +192,7 @@ export function NewJob({ open, onClose, seed }: Props) {
     }
 
     try {
+      const capped = budget.trim() === '' ? null : Math.max(0, Math.round(Number(budget)))
       const created = seed
         ? // Every field is sent explicitly, including nulls: the form shows the
           // inherited settings, so leaving one as "server default" has to actually
@@ -195,6 +203,7 @@ export function NewJob({ open, onClose, seed }: Props) {
             ...(teamId === '' ? {} : { team_id: teamId }),
             provider_id: providerId || null,
             sandbox: sandbox || null,
+            token_budget: capped,
             agents,
           })
         : await api.createJob({
@@ -203,6 +212,7 @@ export function NewJob({ open, onClose, seed }: Props) {
             ...(teamId === '' ? {} : { team_id: teamId }),
             ...(providerId ? { provider_id: providerId } : {}),
             ...(sandbox ? { sandbox } : {}),
+            ...(capped === null ? {} : { token_budget: capped }),
             ...(agents.length > 0 ? { agents } : {}),
           })
       onClose()
@@ -355,6 +365,22 @@ export function NewJob({ open, onClose, seed }: Props) {
                 ) : null}
               </label>
             ) : null}
+
+            <label className="field">
+              <span>Token cap</span>
+              <input
+                type="number"
+                min={0}
+                step={1000}
+                value={budget}
+                onChange={(event) => setBudget(event.target.value)}
+                placeholder="server default"
+              />
+              <span className="field-note">
+                The job stops at the next provider call once it is spent, and says so.
+                Type 0 for no cap at all.
+              </span>
+            </label>
           </div>
 
           <section className="agent-assign">

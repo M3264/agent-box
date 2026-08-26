@@ -42,7 +42,8 @@ ProviderId = Annotated[str, Path(min_length=1, max_length=64, pattern=r"^[A-Za-z
 
 async def _models_for(provider_id: str) -> list[dict[str, Any]]:
     rows = await db.fetch_all(
-        "select model,label,supports_tools from provider_models where provider_id=? order by model",
+        "select model,label,supports_tools,price_in,price_out from provider_models"
+        " where provider_id=? order by model",
         (provider_id,),
     )
     return [
@@ -50,6 +51,10 @@ async def _models_for(provider_id: str) -> list[dict[str, Any]]:
             "model": row["model"],
             "label": row["label"],
             "supports_tools": bool(row["supports_tools"]),
+            # Null, not 0. An unpriced model is shown as unpriced rather than free, and
+            # the difference is the whole reason the columns are nullable.
+            "price_in": row["price_in"],
+            "price_out": row["price_out"],
         }
         for row in rows
     ]
@@ -150,11 +155,20 @@ async def upsert_provider(provider_id: ProviderId, payload: ProviderUpsert) -> d
         )
         for entry in payload.models:
             await conn.execute(
-                "insert into provider_models(provider_id,model,label,supports_tools,created_at)"
-                " values(?,?,?,?,unixepoch('subsec'))"
+                "insert into provider_models(provider_id,model,label,supports_tools,"
+                "price_in,price_out,created_at)"
+                " values(?,?,?,?,?,?,unixepoch('subsec'))"
                 " on conflict(provider_id,model) do update set"
-                "  label=excluded.label,supports_tools=excluded.supports_tools",
-                (payload.id, entry.model, entry.label, int(entry.supports_tools)),
+                "  label=excluded.label,supports_tools=excluded.supports_tools,"
+                "  price_in=excluded.price_in,price_out=excluded.price_out",
+                (
+                    payload.id,
+                    entry.model,
+                    entry.label,
+                    int(entry.supports_tools),
+                    entry.price_in,
+                    entry.price_out,
+                ),
             )
 
     row = await db.fetch_one("select * from provider_profiles where id=?", (payload.id,))

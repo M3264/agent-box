@@ -9,6 +9,12 @@
  * Counts come from the provider's own usage block, accumulated as each call returns,
  * so a running job's numbers are live and a job that died mid-phase still reports
  * what it burned before it died.
+ *
+ * Money is computed on read from the prices on each provider model, never stamped at
+ * call time — a price corrected next week should fix last week's estimate rather than
+ * leaving it permanently wrong. A model with no price on file contributes nothing to
+ * the figure and is counted separately as unpriced, because a confident `$0.00` on an
+ * unpriced job is the one number here that would actually mislead.
  */
 
 import type { CSSProperties } from 'react'
@@ -22,6 +28,11 @@ interface Props {
 /** Compact for headline figures, exact in the cells. */
 function tokens(count: number): string {
   return count.toLocaleString()
+}
+
+/** Cents matter on a cheap job and stop mattering on an expensive one. */
+function money(amount: number): string {
+  return amount < 1 ? `$${amount.toFixed(4)}` : `$${amount.toFixed(2)}`
 }
 
 /** Share of the whole, for the inline bars. Guards a zero total. */
@@ -43,7 +54,7 @@ function byRound(plan: Phase[]): { round: number; phases: number; total: number 
 }
 
 export function UsageView({ job }: Props) {
-  const { totals, by_agent, by_model } = job.usage
+  const { totals, by_agent, by_model, cost, unpriced_tokens } = job.usage
 
   if (totals.calls === 0) {
     return (
@@ -66,6 +77,12 @@ export function UsageView({ job }: Props) {
           <span className="usage-figure-value">{tokens(totals.total)}</span>
           <span className="usage-figure-label">total tokens</span>
         </div>
+        <div className="usage-figure usage-figure-money">
+          <span className="usage-figure-value">{cost === null ? '—' : money(cost)}</span>
+          <span className="usage-figure-label">
+            {cost === null ? 'no prices on file' : 'estimated'}
+          </span>
+        </div>
         <div className="usage-figure">
           <span className="usage-figure-value">{tokens(totals.prompt)}</span>
           <span className="usage-figure-label">prompt</span>
@@ -87,6 +104,14 @@ export function UsageView({ job }: Props) {
           <span className="usage-figure-label">avg per call</span>
         </div>
       </div>
+
+      {unpriced_tokens > 0 ? (
+        <p className="usage-note">
+          {tokens(unpriced_tokens)} tokens went through a model with no price on file, so
+          they are missing from the estimate. Prices are per million tokens, on each model
+          in Settings.
+        </p>
+      ) : null}
 
       <section className="usage-section">
         <h2>By agent</h2>
@@ -130,6 +155,7 @@ export function UsageView({ job }: Props) {
               <th scope="col">Model</th>
               <th scope="col">Calls</th>
               <th scope="col">Total</th>
+              <th scope="col">Cost</th>
             </tr>
           </thead>
           <tbody>
@@ -139,6 +165,9 @@ export function UsageView({ job }: Props) {
                 <td className="mono">{row.model ?? 'unrecorded'}</td>
                 <td>{row.calls.toLocaleString()}</td>
                 <td className="usage-strong">{tokens(row.total)}</td>
+                <td className={row.cost === null ? 'muted' : ''}>
+                  {row.cost === null ? 'unpriced' : money(row.cost)}
+                </td>
               </tr>
             ))}
           </tbody>

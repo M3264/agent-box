@@ -54,7 +54,7 @@ from app.orchestrator.sandbox import SANDBOXED, Completed, SandboxError, _Sandbo
 
 log = get_logger("agent_hub.tools")
 
-TOOL_NAMES = ("run", "read_file", "write_file", "fetch")
+TOOL_NAMES = ("run", "read_file", "write_file", "fetch", "ask_operator")
 
 #: Where full command output is kept, relative to the workspace. Inside the
 #: workspace on purpose: a 40MB build log the agent can grep is more useful than one
@@ -148,6 +148,72 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_operator",
+            # Written at the model rather than at a reader, because the failure mode
+            # this tool exists to prevent is a model that would rather guess than
+            # look indecisive — and the opposite failure, a model that asks instead
+            # of reading a file, is just as bad. Both halves are spelled out.
+            "description": (
+                "Ask the operator a question and wait for their answer. Use this when "
+                "you are blocked on something only they can decide: which of two "
+                "acceptable directions they want, a target or credential that is not "
+                "in the workspace, or which reading of an ambiguous requirement was "
+                "meant. Prefer offering concrete options over an open question. Do NOT "
+                "use it for anything you could answer yourself by reading a file or "
+                "running a command, and do not use it to ask permission — risky actions "
+                "are gated automatically. The job pauses while this waits, so ask once, "
+                "with everything you need, rather than in instalments."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question, in one or two plain sentences.",
+                    },
+                    "detail": {
+                        "type": "string",
+                        "description": (
+                            "Why you are asking and what turns on the answer. The "
+                            "operator may have no context on what you are doing."
+                        ),
+                    },
+                    "options": {
+                        "type": "array",
+                        "description": (
+                            "The choices you would accept, most likely first. Two to "
+                            "four is usually right."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {
+                                    "type": "string",
+                                    "description": "The choice, short enough to read on a button.",
+                                },
+                                "detail": {
+                                    "type": "string",
+                                    "description": "What picking this one means.",
+                                },
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                    "allow_free_text": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether an answer outside your options is acceptable. "
+                            "Defaults to true."
+                        ),
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
 ]
 
 
@@ -172,6 +238,8 @@ class ToolInvocation:
         if self.tool == "fetch":
             method = str(self.args.get("method") or "GET").upper()
             return f"{method} {self.args.get('url') or '(no url)'}"
+        if self.tool == "ask_operator":
+            return str(self.args.get("question") or "").strip() or "(empty question)"
         return f"{self.tool} {json.dumps(self.args)[:200]}"
 
 
@@ -390,6 +458,15 @@ async def execute(
             return await asyncio.to_thread(_write_file, invocation, workspace)
         if invocation.tool == "fetch":
             return await _fetch(invocation)
+        if invocation.tool == "ask_operator":
+            # Handled by the loop, which is the only layer holding the database, the
+            # event store and the cancel event a blocking question needs. Named
+            # explicitly so a wiring mistake reports itself instead of producing
+            # "Unknown tool 'ask_operator'. Available: … ask_operator".
+            return ToolOutcome(
+                status="error",
+                content="ask_operator is dispatched by the agent loop, not by execute().",
+            )
     except asyncio.CancelledError:
         raise
     except SandboxError as exc:

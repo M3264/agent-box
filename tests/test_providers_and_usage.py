@@ -5,6 +5,11 @@ this, and what did it cost?* Before this, a provider profile was a single model,
 agent used it, the token counts in every response were parsed and discarded, and a
 finished job was a dead end.
 
+The budget section takes that question one step further, to *stop before it costs
+more*. A cap is not a report: it is enforced in ``MeteredProvider.complete``, before
+the call, which is the one place every call in the system passes through — so the tests
+assert a job that stopped itself, not a job that noticed afterwards.
+
 Nothing here touches the network. The adapters are exercised against
 ``httpx.MockTransport``; the engine paths run through the ``FakeProvider`` and
 ``FakePool`` from ``conftest``.
@@ -38,8 +43,11 @@ from app.orchestrator.providers import (
     kind_spec,
     normalize_usage,
 )
-from app.orchestrator.usage import UsageMeter, job_usage
-from tests.conftest import FakeProvider, phase_rows, wait_for_job
+from app.orchestrator.usage import UsageMeter, estimate_cost, job_usage, resolve_budget
+from tests.conftest import FakeProvider, event_kinds, phase_rows, tune, wait_for_job
+
+#: What one scripted call costs: the fake reports 10 prompt + 4 completion tokens.
+PER_CALL = 14
 
 # --------------------------------------------------------------- the usage vocabulary
 
@@ -582,7 +590,213 @@ async def test_usage_of_a_job_that_never_ran_is_zero_not_missing() -> None:
         "totals": {"prompt": 0, "completion": 0, "total": 0, "calls": 0},
         "by_agent": [],
         "by_model": [],
+        # None, not 0.0: nothing was spent *and* nothing was priced, and a job reported as
+        # costing zero is a claim about prices rather than about tokens.
+        "cost": None,
+        "unpriced_tokens": 0,
+        "budget": {"limit": 0, "used": 0, "remaining": None},
     }
+
+
+# ------------------------------------------------------------------------ the budget
+
+
+PRICED = {
+    "id": "fake",
+    "label": "Fake",
+    "base_url": "http://localhost:1/v1",
+    "model": "fake-1",
+}
+
+
+async def price_the_fake(client: httpx.AsyncClient, price_in: float, price_out: float) -> None:
+    saved = await client.put(
+        "/api/providers/fake",
+        json={
+            **PRICED,
+            "models": [{"model": "fake-1", "price_in": price_in, "price_out": price_out}],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+
+
+def test_the_budget_default_only_applies_when_a_job_names_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Null on the row means "the default when it runs"; 0 means "no cap".
+
+    Which is why this cannot be an ``or``: an explicit 0 has to survive a non-zero
+    default, or the operator who deliberately uncapped a job gets capped anyway.
+    """
+    tune(monkeypatch, token_budget_default=1_000)
+    assert resolve_budget(None) == 1_000
+    assert resolve_budget(0) == 0
+    assert resolve_budget(50) == 50
+    assert resolve_budget(-5) == 0, "a negative cap is not a negative allowance"
+
+
+async def test_a_job_stops_itself_when_it_exhausts_its_budget(
+    client: httpx.AsyncClient, job
+) -> None:
+    """The point of a cap as opposed to a receipt.
+
+    Enforced before a call rather than after, so the last call may overshoot the cap —
+    predicting a response's token count is not possible, and refusing calls on a guess
+    would stop jobs that were fine.
+    """
+    job_id = await job(token_budget=PER_CALL + 1)
+    assert await wait_for_job(job_id, "error") == "error"
+
+    usage = (await client.get(f"/api/jobs/{job_id}/usage")).json()
+    assert usage["budget"] == {
+        "limit": PER_CALL + 1,
+        "used": PER_CALL * 2,
+        "remaining": 0,
+    }, "one call was allowed to overshoot; a third must not have run"
+
+    notices = [payload for payload in await event_kinds(job_id, "notice") if payload.get("budget")]
+    assert notices, "a job that stopped over money must say so on the stream"
+    assert "token budget exhausted" in notices[0]["message"]
+    assert "Raise the budget" in notices[0]["message"], "the operator needs the way out"
+
+    failed = [phase for phase in await phase_rows(job_id) if phase["status"] == "failed"]
+    assert len(failed) == 1 and "budget" in failed[0]["error"]
+    assert "budget" in await db.fetch_value("select error from jobs where id=?", (job_id,))
+    assert [phase["status"] for phase in await phase_rows(job_id)].count("skipped") >= 1, (
+        "the remaining phases must be closed out rather than left pending forever"
+    )
+
+
+async def test_raising_the_cap_lets_a_budget_stopped_job_carry_on(
+    client: httpx.AsyncClient, job
+) -> None:
+    """Otherwise the only way forward is a fresh job that repeats work already paid for."""
+    job_id = await job(token_budget=PER_CALL + 1)
+    await wait_for_job(job_id, "error")
+    spent = (await client.get(f"/api/jobs/{job_id}/usage")).json()["totals"]["total"]
+
+    lifted = await client.patch(f"/api/jobs/{job_id}/budget", json={"token_budget": 0})
+    assert lifted.status_code == 200, lifted.text
+    assert lifted.json()["budget"] == {"limit": 0, "used": spent, "remaining": None}
+    assert [
+        payload["message"] for payload in await event_kinds(job_id, "notice")
+    ][-1] == "Token budget removed."
+
+    resumed = await client.post(f"/api/jobs/{job_id}/continue", json={"instruction": "carry on"})
+    assert resumed.status_code == 202, resumed.text
+    assert await wait_for_job(job_id, "complete") == "complete"
+    assert (await client.get(f"/api/jobs/{job_id}/usage")).json()["totals"]["total"] > spent
+
+
+async def test_a_continued_job_does_not_get_a_fresh_allowance(
+    client: httpx.AsyncClient, job
+) -> None:
+    """A cap is on the job, not on the round; otherwise it is a cap on nothing."""
+    job_id = await job()
+    await wait_for_job(job_id, "complete")
+    spent = (await client.get(f"/api/jobs/{job_id}/usage")).json()["totals"]["total"]
+
+    # A cap just above what the job has already spent: the next round gets one call and
+    # then trips it, which it could not do if the meter started each round at zero.
+    await client.patch(f"/api/jobs/{job_id}/budget", json={"token_budget": spent + 1})
+    await client.post(f"/api/jobs/{job_id}/continue", json={"instruction": "and again"})
+    assert await wait_for_job(job_id, "error") == "error"
+
+    usage = (await client.get(f"/api/jobs/{job_id}/usage")).json()
+    assert usage["totals"]["total"] == spent + PER_CALL
+    assert usage["budget"]["remaining"] == 0
+
+
+async def test_the_budget_endpoint_validates_what_it_is_given(
+    client: httpx.AsyncClient, job
+) -> None:
+    job_id = await job()
+    assert (
+        await client.patch(f"/api/jobs/{job_id}/budget", json={"token_budget": -1})
+    ).status_code == 422
+    assert (
+        await client.patch(f"/api/jobs/{job_id}/budget", json={"token_budget": 10**12})
+    ).status_code == 422, "a cap larger than any real endpoint bills is a typo"
+    assert (
+        await client.patch("/api/jobs/nope/budget", json={"token_budget": 10})
+    ).status_code == 404
+    await wait_for_job(job_id, "complete")
+
+
+# -------------------------------------------------------------------------- the cost
+
+
+def test_an_unpriced_model_costs_unknown_rather_than_nothing() -> None:
+    """Folding an unpriced model in at zero would under-report the one number
+    an operator is most likely to trust without checking."""
+    assert estimate_cost(1_000_000, 1_000_000, None, None) is None
+    assert estimate_cost(1_000_000, 1_000_000, 3.0, 15.0) == 18.0
+    # Half a price is still a price: an endpoint that only publishes input costs should
+    # report what is known, not throw it away.
+    assert estimate_cost(1_000_000, 1_000_000, 3.0, None) == 3.0
+    assert estimate_cost(0, 0, 3.0, 15.0) == 0.0
+
+
+async def test_a_priced_model_turns_tokens_into_money(client: httpx.AsyncClient, job) -> None:
+    await price_the_fake(client, price_in=3.0, price_out=15.0)
+
+    job_id = await job()
+    await wait_for_job(job_id, "complete")
+
+    usage = (await client.get(f"/api/jobs/{job_id}/usage")).json()
+    totals = usage["totals"]
+    expected = round(totals["prompt"] * 3.0 / 1_000_000 + totals["completion"] * 15.0 / 1_000_000, 6)
+    assert usage["cost"] == expected > 0
+    assert usage["unpriced_tokens"] == 0
+    assert [entry["cost"] for entry in usage["by_model"]] == [expected]
+
+    # Computed on read, so correcting a price re-prices history. The alternative — a
+    # price stamped on each ledger row — mostly preserves an old typo.
+    await price_the_fake(client, price_in=6.0, price_out=30.0)
+    assert (await client.get(f"/api/jobs/{job_id}/usage")).json()["cost"] == round(expected * 2, 6)
+
+
+async def test_an_unpriced_job_reports_its_tokens_as_unpriced(
+    client: httpx.AsyncClient, job
+) -> None:
+    """"No prices on file" and "free" must not look the same in the UI."""
+    job_id = await job()
+    await wait_for_job(job_id, "complete")
+
+    usage = (await client.get(f"/api/jobs/{job_id}/usage")).json()
+    assert usage["cost"] is None
+    assert usage["unpriced_tokens"] == usage["totals"]["total"] > 0
+    assert [entry["cost"] for entry in usage["by_model"]] == [None]
+
+
+async def test_prices_survive_a_round_trip_through_the_provider_form(
+    client: httpx.AsyncClient,
+) -> None:
+    """Null, not 0: an unpriced model is shown as unpriced rather than as free."""
+    await price_the_fake(client, price_in=1.25, price_out=2.5)
+    profile = next(
+        entry for entry in (await client.get("/api/providers")).json() if entry["id"] == "fake"
+    )
+    assert profile["models"] == [
+        {
+            "model": "fake-1",
+            "label": None,
+            "supports_tools": True,
+            "price_in": 1.25,
+            "price_out": 2.5,
+        }
+    ]
+
+    cleared = await client.put(
+        "/api/providers/fake", json={**PRICED, "models": [{"model": "fake-1"}]}
+    )
+    assert cleared.json()["models"][0]["price_in"] is None, "a price must be removable"
+    assert (
+        await client.put(
+            "/api/providers/fake",
+            json={**PRICED, "models": [{"model": "fake-1", "price_in": -1}]},
+        )
+    ).status_code == 422
 
 
 # -------------------------------------------------------------- per-agent assignment

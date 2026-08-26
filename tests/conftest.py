@@ -19,7 +19,7 @@ import json
 import os
 import tempfile
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -43,11 +43,17 @@ os.environ["AGENT_HUB_SANDBOX"] = "unconfined"
 import httpx  # noqa: E402
 import pytest  # noqa: E402
 
+from app.config import settings  # noqa: E402
 from app.db import db  # noqa: E402
 from app.deps import engine  # noqa: E402
 from app.events import broker, events  # noqa: E402
 from app.main import app  # noqa: E402
+from app.orchestrator import agentloop as agentloop_mod  # noqa: E402
 from app.orchestrator import approvals as approvals_mod  # noqa: E402
+from app.orchestrator import questions as questions_mod  # noqa: E402
+from app.orchestrator import sandbox as sandbox_mod  # noqa: E402
+from app.orchestrator import tools as tools_mod  # noqa: E402
+from app.orchestrator import usage as usage_mod  # noqa: E402
 from app.orchestrator import engine as engine_mod  # noqa: E402
 from app.orchestrator.engine import TERMINAL_JOB_STATUSES  # noqa: E402
 from app.orchestrator.providers import (  # noqa: E402
@@ -82,6 +88,40 @@ DEFAULT_PLAN = {
     ],
     "notes": "straightforward",
 }
+
+#: One work phase, for any test that scripts a tool conversation: the planning and
+#: synthesis calls are offered no tools, so they never consume a scripted turn and the
+#: script lines up one-to-one with the loop's turns.
+ONE_PHASE = {
+    "phases": [
+        {
+            "name": "Do the work",
+            "owner": "coder",
+            "acceptance": "the commands ran and their output was read",
+            "requires_approval": False,
+        }
+    ],
+    "notes": "one phase, so the script and the turns line up",
+}
+
+#: Every module that imported `settings` by value and reads a limit off it. `tune`
+#: repoints all of them, because which module reads which limit is an implementation
+#: detail a test should not have to track.
+_SETTINGS_READERS = (agentloop_mod, tools_mod, sandbox_mod, engine_mod, usage_mod)
+
+
+def tune(monkeypatch: pytest.MonkeyPatch, **changes: Any) -> Any:
+    """Override the frozen settings everywhere they were imported.
+
+    `Settings` is a frozen dataclass built from the environment at import time and
+    each module holds its own reference, so a test can neither mutate it nor patch a
+    single place. `replace` builds a new one from the current values — no environment
+    is re-read — and every reader is repointed at it for the duration of the test.
+    """
+    tweaked = replace(settings, **changes)
+    for module in _SETTINGS_READERS:
+        monkeypatch.setattr(module, "settings", tweaked)
+    return tweaked
 
 
 @dataclass
@@ -333,6 +373,7 @@ async def database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIter
 
     assert engine.active_count == 0, "a test leaked a running job"
     approvals_mod.registry._waiters.clear()
+    questions_mod.registry._waiters.clear()
 
 
 @pytest.fixture
@@ -429,6 +470,25 @@ async def wait_for_approval(job_id: str, timeout: float = 12.0) -> dict[str, Any
     async def check() -> dict[str, Any] | None:
         row = await db.fetch_one(
             "select * from approvals where job_id=? and status='pending'"
+            " order by created_at desc limit 1",
+            (job_id,),
+        )
+        return dict(row) if row else None
+
+    return await wait_until(check, timeout=timeout)
+
+
+async def wait_for_question(job_id: str, timeout: float = 12.0) -> dict[str, Any]:
+    """Wait for an agent to be parked on a question, and return the row.
+
+    Waits for the row rather than for the job's ``blocked`` status because the row is
+    what an answer is posted against — and the two are written in the other order, so a
+    helper keyed on the status would return before the question could be answered.
+    """
+
+    async def check() -> dict[str, Any] | None:
+        row = await db.fetch_one(
+            "select * from questions where job_id=? and status='pending'"
             " order by created_at desc limit 1",
             (job_id,),
         )

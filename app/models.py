@@ -9,6 +9,11 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 Mode = Literal["controlled", "yolo"]
 Decision = Literal["approved", "rejected"]
 Sandbox = Literal["sandboxed", "unconfined"]
+#: When a queued operator message reaches the team. ``boundary`` waits for the next
+#: phase, which is the polite default; ``immediate`` is injected into the running
+#: agent's conversation at its next turn, which is as fast as it can be honoured
+#: without killing work already in flight.
+Delivery = Literal["boundary", "immediate"]
 
 #: Job statuses nothing may write over with a non-terminal one. Lives here, with the
 #: other shared vocabulary, because both the engine and the tool loop need it and the
@@ -49,6 +54,10 @@ class JobCreate(BaseModel):
     #: the resolved value on the row (rather than reading the setting per command)
     #: is what keeps the audit trail honest if the default changes mid-job.
     sandbox: Sandbox | None = None
+    #: Total tokens this job may spend across every round before it stops itself. None
+    #: takes the server default, 0 means no cap. A ceiling rather than a report: on a
+    #: metered endpoint the useful moment to find out is before, not after.
+    token_budget: int | None = Field(default=None, ge=0, le=1_000_000_000)
     #: Per-agent overrides of ``provider_id``. The job-level provider stays the
     #: default for every agent that is not listed, so the simple case still needs
     #: nothing but a task.
@@ -110,6 +119,7 @@ class JobRerun(BaseModel):
     #: a re-run form shows the inherited provider and has to be able to unset it.
     provider_id: str | None = None
     sandbox: Sandbox | None = None
+    token_budget: int | None = Field(default=None, ge=0, le=1_000_000_000)
     #: None inherits the original's assignments; an empty list clears them.
     agents: list[AgentAssignment] | None = Field(default=None, max_length=12)
 
@@ -127,6 +137,7 @@ class JobRerun(BaseModel):
 class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=20_000)
     agent: str = "manager"
+    delivery: Delivery = "boundary"
 
     @field_validator("content")
     @classmethod
@@ -135,6 +146,71 @@ class MessageCreate(BaseModel):
         if not stripped:
             raise ValueError("content must not be blank")
         return stripped
+
+
+class MessageUpdate(BaseModel):
+    """Change a message that has not been delivered yet.
+
+    Both fields are optional so the two things an operator actually wants are separate
+    actions rather than one form: fix the wording, or stop waiting for the phase
+    boundary. ``model_fields_set`` tells an omitted field from an explicit one, so
+    sending only ``delivery`` never silently rewrites the text.
+    """
+
+    content: str | None = Field(default=None, min_length=1, max_length=20_000)
+    delivery: Delivery | None = None
+
+    @field_validator("content")
+    @classmethod
+    def _strip(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("content must not be blank")
+        return stripped
+
+    @model_validator(mode="after")
+    def _something_to_do(self) -> MessageUpdate:
+        if self.content is None and self.delivery is None:
+            raise ValueError("send content, delivery, or both")
+        return self
+
+
+class QuestionAnswer(BaseModel):
+    """The operator's reply to an agent's question.
+
+    Either names one of the offered options, or types an answer, or both — "the second
+    one, but only for the staging bucket" is a real answer and refusing it would push
+    the operator into the free-text box and lose which option they meant.
+    """
+
+    chosen: str | None = Field(default=None, max_length=200)
+    text: str | None = Field(default=None, max_length=20_000)
+
+    @field_validator("text")
+    @classmethod
+    def _strip(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+    @model_validator(mode="after")
+    def _not_empty(self) -> QuestionAnswer:
+        if not self.chosen and not self.text:
+            raise ValueError("pick an option or write an answer")
+        return self
+
+
+class BudgetUpdate(BaseModel):
+    """Change a job's token cap while it exists.
+
+    Exists mainly for the job that stopped *because* of its cap: without a way to raise
+    it, the only route forward is a fresh job that repeats work already paid for. 0
+    removes the cap.
+    """
+
+    token_budget: int = Field(ge=0, le=1_000_000_000)
 
 
 class ApprovalCreate(BaseModel):
@@ -158,6 +234,10 @@ class ProviderModel(BaseModel):
     #: Advisory. For a model the operator knows cannot call tools, on an endpoint that
     #: otherwise can — the profile-level flag still wins when it is off.
     supports_tools: bool = True
+    #: Price per million tokens, in whatever currency the operator prices in. None means
+    #: unknown, which the UI shows as unpriced rather than as free.
+    price_in: float | None = Field(default=None, ge=0, le=10_000)
+    price_out: float | None = Field(default=None, ge=0, le=10_000)
 
     @field_validator("model")
     @classmethod

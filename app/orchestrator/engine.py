@@ -34,7 +34,7 @@ from app.db import Database
 from app.events import EventStore
 from app.logging_setup import get_logger
 from app.models import TERMINAL_JOB_STATUSES
-from app.orchestrator import agentloop, approvals, sandbox as sandbox_mod
+from app.orchestrator import agentloop, approvals, messages, questions, sandbox as sandbox_mod
 from app.orchestrator.providers import (
     Completion,
     Message,
@@ -43,7 +43,7 @@ from app.orchestrator.providers import (
     ProviderPool,
 )
 from app.orchestrator.roles import Role, Team, load_team
-from app.orchestrator.usage import MeteredProvider, UsageMeter
+from app.orchestrator.usage import BudgetExceeded, MeteredProvider, UsageMeter, resolve_budget
 
 log = get_logger("agent_hub.engine")
 
@@ -347,22 +347,11 @@ class JobEngine:
         """Consume operator guidance so it can be injected into the next prompt.
 
         v1 stored these and never read them, so the "lead conversation" in PLAN.md
-        §1 went nowhere.
+        §1 went nowhere. The queue itself now lives in ``orchestrator.messages``,
+        because the tool loop drains it too — mid-phase, for messages the operator
+        marked urgent — and both drains have to agree about what "delivered" means.
         """
-        rows = await self.db.fetch_all(
-            "select id,content from job_messages"
-            " where job_id=? and role='operator' and consumed_at is null order by id",
-            (job_id,),
-        )
-        if not rows:
-            return []
-        ids = [int(row["id"]) for row in rows]
-        placeholders = ",".join("?" * len(ids))
-        await self.db.execute(
-            f"update job_messages set consumed_at=unixepoch('subsec') where id in ({placeholders})",
-            ids,
-        )
-        return [row["content"] for row in rows]
+        return await messages.drain(self.db, job_id)
 
     @staticmethod
     def _context_block(outputs: list[tuple[str, str, str]]) -> str:
@@ -407,7 +396,15 @@ class JobEngine:
                 if current is None or current in {"complete", "stopped"}:
                     await self._set_agent(job_id, role.id, "queued", "Queued")
 
-            meter = UsageMeter(db=self.db, job_id=job_id)
+            # Seeded with what the job has already spent, so a cap is a cap on the job
+            # rather than on each round — a continued job cannot get a fresh allowance
+            # by being continued.
+            meter = UsageMeter(
+                db=self.db,
+                job_id=job_id,
+                budget=resolve_budget(job["token_budget"]),
+                spent=int(job["total_tokens"] or 0),
+            )
             # One pool per job rather than one provider: each agent may name its own
             # provider and model, and the pool builds each distinct pair once over a
             # single shared HTTP client.
@@ -464,6 +461,11 @@ class JobEngine:
                 "update job_agents set status='error',current_action='Error',"
                 "updated_at=unixepoch('subsec') where job_id=? and status='active'",
                 (job_id,),
+            )
+            # Nobody is left to read an answer, so the question is closed rather than
+            # left pending — the same reasoning as the skipped phases above.
+            await questions.cancel_open(
+                self.db, self.store, job_id=job_id, reason=f"The job failed: {exc}"
             )
             await self.store.record(job_id, "status", {"status": "error"}, source="system")
 
@@ -629,6 +631,19 @@ class JobEngine:
                 output = await self._do_work(job, team, provider, phase, role, guidance, box, cancel)
         except asyncio.CancelledError:
             raise
+        except BudgetExceeded as exc:
+            # A stop, not a failure of the work — so it is said in those words before the
+            # phase is marked, and the operator is told what to do about it. The job still
+            # ends terminal: continuing on a cap that is already exhausted would spend
+            # exactly one more call to arrive back here.
+            await self.store.record(
+                job_id,
+                "notice",
+                {"message": str(exc), "phase_id": phase.id, "budget": True},
+                source="system",
+            )
+            await self._fail_phase(job_id, phase, str(exc))
+            raise JobFailed(str(exc)) from exc
         except ProviderError as exc:
             await self._fail_phase(job_id, phase, str(exc))
             raise JobFailed(f"phase '{phase.name}' failed: {exc}") from exc

@@ -21,7 +21,24 @@ export type Connection = 'connecting' | 'live' | 'reconnecting' | 'closed' | 'go
 
 const TERMINAL = new Set(['complete', 'error', 'stopped'])
 const RECONNECT_STEPS = [500, 1000, 2000, 5000, 10_000]
-const REFETCH_ON = new Set(['plan', 'phase', 'approval', 'artifact', 'guidance', 'message', 'tool_call'])
+/**
+ * Kinds whose payload is not enough on its own.
+ *
+ * `question` is here because the row carries the normalised option values the buttons
+ * post back, and `notice` because the budget notice changes the ledger rather than the
+ * transcript — neither can be applied from the event alone.
+ */
+const REFETCH_ON = new Set([
+  'plan',
+  'phase',
+  'approval',
+  'artifact',
+  'guidance',
+  'message',
+  'tool_call',
+  'question',
+  'notice',
+])
 
 interface Frame {
   type: 'hello' | 'event' | 'ping' | 'end' | 'error'
@@ -86,9 +103,11 @@ export function useJobStream(jobId: string): JobStream {
             artifacts: snapshot.artifacts,
             messages: snapshot.messages,
             approvals: snapshot.approvals,
+            questions: snapshot.questions,
             tool_calls: snapshot.tool_calls,
             sandbox: snapshot.sandbox,
             usage: snapshot.usage,
+            token_budget: snapshot.token_budget,
             agent_providers: snapshot.agent_providers,
             can_continue: snapshot.can_continue,
             rounds: snapshot.rounds,

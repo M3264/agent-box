@@ -1,9 +1,11 @@
 /**
- * The jobs list — PLAN.md §4's home screen.
+ * The jobs list.
  *
- * The "needs attention" figure comes from `pending_approvals`, computed by the list
- * endpoint. v1 derived it from `status === 'approval-needed'`, a status the backend
- * never set, so the card read 0 no matter what was waiting.
+ * The "needs attention" figure comes from the counts the list endpoint computes —
+ * approvals *and* questions, because both park a job in exactly the same way and an
+ * operator counting only one of them would walk past a stalled job. v1 derived it from
+ * `status === 'approval-needed'`, a status the backend never set, so the card read 0 no
+ * matter what was waiting.
  */
 
 import { useMemo, useState } from 'react'
@@ -23,7 +25,7 @@ function matches(job: JobSummary, filter: Filter): boolean {
     case 'live':
       return LIVE.includes(job.status)
     case 'attention':
-      return job.pending_approvals > 0 || job.status === 'error'
+      return job.pending_approvals + job.pending_questions > 0 || job.status === 'error'
     case 'done':
       return job.status === 'complete' || job.status === 'stopped'
     default:
@@ -124,7 +126,7 @@ export function JobsScreen() {
       {!loading && visible.length === 0 ? (
         <Empty
           title={jobs.length === 0 ? 'No jobs yet' : 'Nothing matches that filter'}
-          hint={jobs.length === 0 ? 'Start one with “New job” in the top right.' : undefined}
+          hint={jobs.length === 0 ? 'Start one with “New job” in the rail on the left.' : undefined}
         />
       ) : (
         <ul className="job-list">
@@ -180,7 +182,19 @@ export function JobsScreen() {
                   ) : null}
                   {job.pending_approvals > 0 ? (
                     <span className="pill pill-warn">
+                      <span className="dot" aria-hidden />
                       {job.pending_approvals} to approve
+                    </span>
+                  ) : null}
+                  {job.pending_questions > 0 ? (
+                    <span className="pill pill-warn">
+                      <span className="dot" aria-hidden />
+                      {job.pending_questions} question{job.pending_questions === 1 ? '' : 's'}
+                    </span>
+                  ) : null}
+                  {job.pending_messages > 0 ? (
+                    <span className="pill pill-busy">
+                      {job.pending_messages} unread
                     </span>
                   ) : null}
                   {job.artifact_count > 0 ? (

@@ -34,6 +34,8 @@ import asyncio
 import json
 import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,7 +44,7 @@ from app.db import Database
 from app.events import EventStore
 from app.logging_setup import get_logger
 from app.models import TERMINAL_JOB_STATUSES
-from app.orchestrator import approvals, tools
+from app.orchestrator import approvals, messages as messages_mod, questions, tools
 from app.orchestrator.providers import (
     Message,
     Provider,
@@ -75,6 +77,7 @@ You have a working shell and can act, not just describe. Available tools:
 - read_file(path, start_line?, max_lines?) — read a file, or list a directory.
 - write_file(path, content, append?) — write a real file.
 - fetch(url, method?, body?, headers?) — an HTTP request.
+- ask_operator(question, detail?, options?) — ask the human and wait for their answer.
 
 Working agreement:
 
@@ -87,6 +90,11 @@ Working agreement:
 - Every command is recorded and shown to the operator. Commands that look risky —
   sudo, package installs, pushing to a remote, reading credentials — pause for a human
   to approve before they run, so expect an occasional wait rather than a refusal.
+- Ask rather than assume, but only about things you cannot find out. If the task is
+  ambiguous in a way that changes what you build, or needs a fact that is not in the
+  workspace, call ask_operator with concrete options. If you could settle it by
+  reading a file or running a command, do that instead — and never use ask_operator to
+  request permission, which is handled for you.
 - Stop calling tools when the phase is done, and reply with your findings. Your last
   message with no tool call is what the next specialist and the operator will read, so
   make it stand on its own: what you did, what the output showed, what remains.
@@ -234,6 +242,34 @@ class ToolLoop:
                 break
 
             turn += 1
+            interjections = await messages_mod.drain(self.db, self.job_id, immediate_only=True)
+            if interjections:
+                # In as a user turn, before the provider call, so the model reads it as
+                # the operator speaking rather than as tool output or as part of its own
+                # reasoning. Announced on the stream too: an instruction that changed
+                # what an agent did mid-phase should be visible at the point it landed,
+                # not inferred later from a change of direction.
+                messages_text = messages_mod.as_prompt(interjections)
+                messages.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "The operator has just sent this while you were working. Take "
+                            f"it into account from here on:\n\n{messages_text}"
+                        ),
+                    )
+                )
+                await self.store.record(
+                    self.job_id,
+                    "guidance",
+                    {
+                        "messages": interjections,
+                        "phase_id": self.phase_id,
+                        "immediate": True,
+                        "turn": turn,
+                    },
+                    source="operator",
+                )
             completion = await complete_with_timeout(
                 self.provider,
                 system=system,
@@ -361,7 +397,7 @@ class ToolLoop:
 
         risk = tools.classify(invocation, workspace=self.workspace)
         if risk is not None:
-            approval_id, allowed = await self._ask_operator(invocation, risk)
+            approval_id, allowed = await self._gate(invocation, risk)
             if not allowed:
                 outcome = tools.ToolOutcome(
                     status="denied",
@@ -383,11 +419,18 @@ class ToolLoop:
             "update tool_calls set status='running',started_at=unixepoch('subsec') where id=?",
             (invocation.id,),
         )
-        await self._set_action(f"$ {invocation.display[:120]}")
+        asking = invocation.tool == "ask_operator"
+        await self._set_action(
+            f"Asking you: {invocation.display[:110]}" if asking else f"$ {invocation.display[:120]}"
+        )
 
         try:
-            outcome = await tools.execute(
-                invocation, sandbox=self.sandbox, workspace=self.workspace
+            outcome = (
+                await self._ask_question(invocation)
+                if asking
+                else await tools.execute(
+                    invocation, sandbox=self.sandbox, workspace=self.workspace
+                )
             )
         except asyncio.CancelledError:
             # Leave the row as 'running'. It genuinely was, and recovery is the only
@@ -395,7 +438,13 @@ class ToolLoop:
             raise
 
         await self._finalise_row(invocation, outcome, approval_id)
-        await self._emit(invocation, outcome, risk=risk)
+        # No `tool_call` event for a question. `questions.request` and `questions.answer`
+        # already narrate it into the stream with the options and the answer attached,
+        # and a second event saying `$ Which of these did you mean?` would render the
+        # same moment twice, worse. The `tool_calls` row is still written, so the audit
+        # trail and the Commands view are unaffected.
+        if not asking:
+            await self._emit(invocation, outcome, risk=risk)
         if outcome.status == "interrupted":
             # The row is committed; now stop. Something outside killed this command, so
             # nobody knows whether it did its work — and a loop that carried on would
@@ -409,25 +458,23 @@ class ToolLoop:
         await self._set_action(self.phase_name)
         return outcome
 
-    async def _ask_operator(self, invocation: tools.ToolInvocation, risk: Risk) -> tuple[str, bool]:
-        """Raise a command-level gate and block on it.
+    @asynccontextmanager
+    async def _blocked(self) -> AsyncIterator[None]:
+        """Hold the job at ``blocked`` for as long as it is waiting on the operator.
 
-        Unlike a phase gate this does not auto-approve in yolo mode. Yolo says "do not
-        review my plan"; it was never a decision about ``sudo`` or ``git push``, and a
-        guardrail hit is precisely the case where a human wants to look.
+        Extracted because two different waits need identical status handling and the
+        subtleties below were learned once each, expensively.
+
+        Blocked *before* the thing being waited on is visible. Creating the gate or the
+        question first leaves a window — short, but real — where the operator's inbox
+        shows something pending on a job that still reads 'running', so the first thing
+        anyone sees is already wrong. The status has to lead, not trail.
         """
-        previous = await self.db.fetch_value(
-            "select status from jobs where id=?", (self.job_id,)
-        )
-        # Blocked *before* the gate is visible. Requesting the approval first leaves a
-        # window — short, but real — where the operator's inbox shows a pending command
-        # gate on a job that still reads 'running', so the first thing anyone sees is
-        # already wrong. The status has to lead the gate, not trail it.
-        #
-        # Guarded, because a stop may already have made the job terminal: the check
-        # below is the last await before this write, and a cancellation requested in
-        # between is delivered only afterwards. Blocking a stopped job would leave it
-        # reading 'blocked' with no task, which nothing later corrects.
+        previous = await self.db.fetch_value("select status from jobs where id=?", (self.job_id,))
+        # Guarded, because a stop may already have made the job terminal: the read above
+        # is the last await before this write, and a cancellation requested in between is
+        # delivered only afterwards. Blocking a stopped job would leave it reading
+        # 'blocked' with no task, which nothing later corrects.
         placeholders = ",".join("?" * len(TERMINAL_JOB_STATUSES))
         blocked = await self.db.execute(
             "update jobs set status='blocked',updated_at=unixepoch('subsec')"
@@ -438,31 +485,16 @@ class ToolLoop:
             raise asyncio.CancelledError()
         await self.store.record(self.job_id, "status", {"status": "blocked"}, source="system")
         try:
-            approval_id = await approvals.request(
-                self.db,
-                self.store,
-                job_id=self.job_id,
-                phase_id=self.phase_id,
-                action=invocation.display[:400],
-                detail=f"{risk.reason} — requested by {self.agent} during '{self.phase_name}'",
-                agent=self.agent,
-                risk=risk.level,
-                kind="tool",
-                # Linked in the same commit as the gate, so nothing can observe a
-                # pending command gate whose row does not point back at it.
-                tool_call_id=invocation.id,
-            )
-            await self._set_action(f"Awaiting approval: {invocation.display[:100]}")
-            decision = await approvals.wait_for(self.db, approval_id, cancelled=self.cancel)
+            yield
         finally:
-            # Back to whatever the job was, so a decided gate does not leave the job
-            # reading 'blocked' while it works. Runs even if requesting the gate failed,
-            # which is why the status change is inside the same try.
+            # Back to whatever the job was, so a resolved wait does not leave the job
+            # reading 'blocked' while it works. Runs even if raising the gate failed,
+            # which is why that is inside the same block.
             #
             # `and status='blocked'` makes this undo *only its own write*, and makes it
             # atomic against whoever else touched the row. Without it a stop is silently
             # reversed: `stop_job` writes 'stopped', then cancels the task, and the
-            # cancellation lands in `wait_for` — so this `finally` runs afterwards and
+            # cancellation lands in the wait — so this `finally` runs afterwards and
             # wrote 'running' back over the terminal status. The job then read 'running'
             # forever with no task behind it, because the phases were already 'skipped'
             # and the startup sweep deliberately skips nothing else. Restoring a status
@@ -479,9 +511,102 @@ class ToolLoop:
                 await self.store.record(
                     self.job_id, "status", {"status": restore}, source="system"
                 )
+
+    async def _gate(self, invocation: tools.ToolInvocation, risk: Risk) -> tuple[str, bool]:
+        """Raise a command-level approval gate and block on it.
+
+        Unlike a phase gate this does not auto-approve in yolo mode. Yolo says "do not
+        review my plan"; it was never a decision about ``sudo`` or ``git push``, and a
+        guardrail hit is precisely the case where a human wants to look.
+        """
+        async with self._blocked():
+            approval_id = await approvals.request(
+                self.db,
+                self.store,
+                job_id=self.job_id,
+                phase_id=self.phase_id,
+                action=invocation.display[:400],
+                detail=f"{risk.reason} — requested by {self.agent} during '{self.phase_name}'",
+                agent=self.agent,
+                risk=risk.level,
+                kind="tool",
+                # Linked in the same commit as the gate, so nothing can observe a
+                # pending command gate whose row does not point back at it.
+                tool_call_id=invocation.id,
+            )
+            await self._set_action(f"Awaiting approval: {invocation.display[:100]}")
+            decision = await approvals.wait_for(self.db, approval_id, cancelled=self.cancel)
         if self.cancel.is_set():
             raise asyncio.CancelledError()
         return approval_id, decision.approved
+
+    async def _ask_question(self, invocation: tools.ToolInvocation) -> tools.ToolOutcome:
+        """Put a question to the operator and block until it resolves.
+
+        Every resolution is a *result*, never an exception: an unanswered question is
+        information the model can act on, and an agent that crashed its phase because
+        nobody was at the keyboard would be a worse tool than one that never asked. The
+        only thing that propagates is cancellation, because a stopped job must not look
+        like a question that came back.
+        """
+        question = str(invocation.args.get("question") or "").strip()
+        if not question:
+            return tools.ToolOutcome(
+                status="error",
+                content=(
+                    "No question was supplied, so nothing was asked. Call ask_operator "
+                    "again with a `question` string."
+                ),
+            )
+
+        # 0 means wait indefinitely, which `wait_for` expresses as None.
+        timeout = float(settings.question_timeout) or None
+        async with self._blocked():
+            question_id, options = await questions.request(
+                self.db,
+                self.store,
+                job_id=self.job_id,
+                phase_id=self.phase_id,
+                agent=self.agent,
+                question=question,
+                detail=str(invocation.args.get("detail") or "").strip() or None,
+                options=invocation.args.get("options"),
+                allow_free_text=bool(invocation.args.get("allow_free_text", True)),
+            )
+            await self._set_action(f"Awaiting an answer: {question[:100]}")
+            answer = await questions.wait_for(
+                self.db,
+                self.store,
+                question_id,
+                job_id=self.job_id,
+                cancelled=self.cancel,
+                timeout=timeout,
+            )
+        if self.cancel.is_set():
+            raise asyncio.CancelledError()
+
+        if answer.answered:
+            # The chosen option is named as well as quoted. A model that offered
+            # "Rewrite it" and "Patch it" reasons better about its own label than about
+            # a sentence, and the label alone is ambiguous once the operator has also
+            # typed something.
+            picked = next(
+                (entry["label"] for entry in options if entry["value"] == answer.chosen), None
+            )
+            body = f'The operator answered: "{answer.text}"'
+            if picked is not None and picked != answer.text:
+                body = f'The operator chose "{picked}" and added: "{answer.text}"'
+            return tools.ToolOutcome(
+                status="ok",
+                content=f"{body}\n\nAct on that answer now; do not ask again.",
+                stdout=answer.text,
+            )
+
+        return tools.ToolOutcome(
+            status="timeout" if answer.status == "timeout" else "cancelled",
+            content=answer.text,
+            stderr=answer.text,
+        )
 
     # ------------------------------------------------------------------ recording
 
@@ -594,6 +719,16 @@ async def interrupted_notice(database: Database, phase_id: int) -> str:
         except (json.JSONDecodeError, TypeError):
             args = {}
         display = tools.ToolInvocation(id="", tool=row["tool"], args=args).display
+        if row["tool"] == "ask_operator":
+            # A question has no side effects, so the command wording below would be a
+            # lie in the one direction that matters: it would tell the model the
+            # workspace might already reflect something that never touched it. What it
+            # does need to know is that asking again is allowed.
+            lines.append(
+                f"- you asked the operator `{display}` and the question was closed "
+                "unanswered; ask again if you still need it"
+            )
+            continue
         state = (
             "was already running when the service restarted, so the workspace may "
             "already reflect it"
@@ -640,6 +775,18 @@ async def sweep_interrupted(database: Database) -> int:
         "update approvals set status='rejected',decided_at=unixepoch('subsec'),"
         "decision_note='cancelled by restart; the phase will re-run'"
         " where kind='tool' and status='pending'"
+        " and job_id in (select id from jobs where status not in ('complete','error','stopped'))"
+    )
+    # And neither must a question. This is the one place a question is *less* durable
+    # than the row that records it: the answer would be delivered into a tool-loop
+    # conversation that died with the process, so there is nothing left to unblock.
+    # The phase re-runs from turn 1 and the agent asks again if it still needs to —
+    # which is honest, where an answered question nobody consumed would not be.
+    await database.execute(
+        "update questions set status='cancelled',"
+        "answer='The service restarted before this was answered; the phase re-ran.',"
+        "answered_at=unixepoch('subsec')"
+        " where status='pending'"
         " and job_id in (select id from jobs where status not in ('complete','error','stopped'))"
     )
     if running or pending:
