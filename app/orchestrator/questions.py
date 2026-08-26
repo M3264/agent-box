@@ -34,6 +34,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from app import push
 from app.db import Database
 from app.events import EventStore
 from app.logging_setup import get_logger
@@ -206,6 +207,9 @@ async def request(
             "options": len(normalised),
         },
     )
+    # A new question is the other rise in "a job needs you"; push it exactly as an
+    # approval does. No-op when push is off or unconfigured.
+    push.notify(job_id, kind="question", agent=agent, summary=question)
     return question_id, normalised
 
 

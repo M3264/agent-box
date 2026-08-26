@@ -213,6 +213,34 @@ class BudgetUpdate(BaseModel):
     token_budget: int = Field(ge=0, le=1_000_000_000)
 
 
+class PushKeys(BaseModel):
+    """The public halves of a browser's push subscription.
+
+    These are exactly the keys the browser mints for itself; the payload is encrypted
+    to them so only that browser can read it. They carry no server secret.
+    """
+
+    p256dh: str = Field(min_length=1, max_length=200)
+    auth: str = Field(min_length=1, max_length=100)
+
+
+class PushSubscribe(BaseModel):
+    """A browser opting in to away-from-browser notifications.
+
+    Shaped like the ``PushSubscription.toJSON()`` the browser emits, so the frontend
+    can post it verbatim. Re-subscribing the same browser upserts on ``endpoint``.
+    """
+
+    endpoint: str = Field(min_length=1, max_length=2_000)
+    keys: PushKeys
+
+
+class PushUnsubscribe(BaseModel):
+    """A browser opting back out, identified by the endpoint it subscribed with."""
+
+    endpoint: str = Field(min_length=1, max_length=2_000)
+
+
 class ApprovalCreate(BaseModel):
     action: str = Field(min_length=1, max_length=500)
     detail: str | None = None

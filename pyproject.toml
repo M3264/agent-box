@@ -9,6 +9,10 @@ dependencies = [
     "httpx>=0.27",
     "aiosqlite>=0.20",
     "pydantic>=2.7",
+    # Web Push (away-from-browser notifications). Pulls cryptography, http-ece,
+    # py-vapid and requests. Imported lazily in app.push so its DeprecationWarnings
+    # never reach pytest's error filter.
+    "pywebpush>=2.0",
 ]
 
 [project.optional-dependencies]

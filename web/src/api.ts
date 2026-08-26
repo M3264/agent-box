@@ -26,6 +26,8 @@ import type {
   Provider,
   ProviderKind,
   ProviderTemplate,
+  PushInfo,
+  PushSubscriptionPayload,
   Question,
   SandboxInfo,
   SandboxKind,
@@ -223,4 +225,16 @@ export const api = {
   setDefaultTeam: (id: number) => request<Team>(`/api/teams/${id}/default`, { method: 'POST' }),
 
   sandbox: () => request<SandboxInfo>('/api/sandbox'),
+
+  // -- Web Push: reaching this browser when no tab is open ---------------------
+  /** The public VAPID key + whether push is configured + how many are subscribed. */
+  push: () => request<PushInfo>('/api/push'),
+  /** Store this browser's subscription. Upserts on the endpoint, so it is idempotent. */
+  pushSubscribe: (sub: PushSubscriptionPayload) =>
+    request<{ ok: boolean; subscribers: number }>('/api/push/subscribe', body(sub)),
+  /** Forget this browser's subscription. */
+  pushUnsubscribe: (endpoint: string) =>
+    request<{ ok: boolean; subscribers: number }>('/api/push/unsubscribe', body({ endpoint })),
+  /** Fan a single test push out to every subscription, so the switch can prove itself. */
+  pushTest: () => request<{ ok: boolean; sent: number }>('/api/push/test', { method: 'POST' }),
 }

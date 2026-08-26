@@ -118,6 +118,35 @@ class Settings:
         default_factory=lambda: _env_int("AGENT_HUB_TOKEN_BUDGET", 0)
     )
 
+    # -- away-from-browser notifications (Web Push) --------------------------
+    #: Off makes every push a no-op and skips key generation entirely, so the feature
+    #: can be switched off without touching the frontend. On is the default: a job that
+    #: parks on a question at 3am with every tab closed is invisible otherwise.
+    push_enabled: bool = field(default_factory=lambda: _env_bool("AGENT_HUB_PUSH", True))
+    #: The VAPID ``sub`` claim sent to the browser's push service — a contact for
+    #: whoever runs this instance, as ``mailto:`` or ``https:``. The default is a
+    #: placeholder; some services (Apple's especially) prefer a real address.
+    vapid_subject: str = field(
+        default_factory=lambda: _env_str("AGENT_HUB_VAPID_SUBJECT", "mailto:agent-hub@localhost")
+    )
+    #: The VAPID keypair. Left blank, it is generated once and persisted to
+    #: ``vapid_file`` (below) at mode 0600. Set both to pin a keypair from the
+    #: environment instead — the private key is a secret and, like every other secret
+    #: in this system, never lands in the database or an API response.
+    vapid_public_key: str = field(
+        default_factory=lambda: _env_str("AGENT_HUB_VAPID_PUBLIC_KEY", "")
+    )
+    vapid_private_key: str = field(
+        default_factory=lambda: _env_str("AGENT_HUB_VAPID_PRIVATE_KEY", "")
+    )
+
+    @property
+    def vapid_file(self) -> Path:
+        """Where a generated keypair is persisted, beside the database. A test that
+        repoints the DB gets an isolated keyfile for free, so a push test never writes
+        into the real ``data/``."""
+        return self.db_path.parent / "vapid.json"
+
     def ensure_dirs(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.workspace_root.mkdir(parents=True, exist_ok=True)

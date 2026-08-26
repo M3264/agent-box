@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from app import push
 from app.db import Database
 from app.events import EventStore
 from app.logging_setup import get_logger
@@ -142,6 +143,11 @@ async def request(
             "kind": kind,
         },
     )
+    # A pending gate is a rise in "a job needs you" — the away-from-browser push fires
+    # from here. An auto-approval (yolo mode) blocks nobody and must not notify, which
+    # is exactly the status split. Fire-and-forget, and a no-op when push is off.
+    if status == "pending":
+        push.notify(job_id, kind="approval", agent=agent, summary=action)
     return approval_id
 
 

@@ -27,10 +27,12 @@ from collections.abc import AsyncIterator
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
+from app import push
 from app.api import approvals as approvals_api
 from app.api import attention as attention_api
 from app.api import config as config_api
 from app.api import jobs as jobs_api
+from app.api import push as push_api
 from app.api import stream as stream_api
 from app.config import settings
 from app.db import db
@@ -61,6 +63,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     applied = await migrate(db)
     if applied:
         log.info("applied migrations", extra={"versions": applied})
+    await push.setup()
     await bootstrap_profiles(db)
 
     backends = await probe_sandboxes()
@@ -75,6 +78,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         log.info("shutting down", extra={"active_jobs": engine.active_count})
         await engine.shutdown(settings.shutdown_grace)
+        await push.drain()
         await db.close()
         log.info("shutdown complete")
 
@@ -90,6 +94,7 @@ app.include_router(jobs_api.router)
 app.include_router(approvals_api.router)
 app.include_router(attention_api.router)
 app.include_router(config_api.router)
+app.include_router(push_api.router)
 app.include_router(stream_api.router)
 
 
@@ -117,6 +122,10 @@ async def health() -> Health:
                 "select count(*) from approvals where status='pending'", default=0
             )
         )
+        detail["push"] = {
+            "configured": push.configured(),
+            "subscribers": await push.subscriber_count(),
+        }
         status = "ok"
     except Exception as exc:  # noqa: BLE001 - health must answer, not raise
         log.error("health check failed", exc_info=True)

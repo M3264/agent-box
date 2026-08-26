@@ -29,6 +29,10 @@ static/assets/*.map
 .env
 *.env
 !.env.example
+# The VAPID keypair for Web Push. The private key signs push messages and must never
+# be committed; it is generated on first start and persisted here at mode 0600. The
+# data/*.db* globs above do not cover a .json file, so it is named explicitly.
+data/vapid.json
 
 # TypeScript incremental build cache
 web/tsconfig.tsbuildinfo

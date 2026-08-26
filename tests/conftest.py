@@ -39,6 +39,10 @@ os.environ["AGENT_HUB_SHUTDOWN_GRACE"] = "2"
 # unpinned default would turn a missing kernel feature into 65 failures. Commands
 # in tests are harmless (`echo`, `cat`, `sleep`) and run in a temp workspace.
 os.environ["AGENT_HUB_SANDBOX"] = "unconfined"
+# Push fan-out is pinned off so the real lifespan every test runs never generates a
+# VAPID key or schedules a send. The push tests opt in explicitly by calling
+# `push.setup(vapid_file=..., enabled=True)` themselves.
+os.environ["AGENT_HUB_PUSH"] = "0"
 
 import httpx  # noqa: E402
 import pytest  # noqa: E402

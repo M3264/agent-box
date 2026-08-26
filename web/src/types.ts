@@ -440,6 +440,26 @@ export interface Team {
   created_at: number
 }
 
+/**
+ * What a browser needs to opt in to Web Push, plus enough to show current state.
+ *
+ * `key` is the public VAPID `applicationServerKey` — the private half never leaves the
+ * server. `configured: false` means push is switched off there, so the UI offers no
+ * switch rather than a switch that cannot deliver.
+ */
+export interface PushInfo {
+  configured: boolean
+  key: string | null
+  /** How many browsers are subscribed right now, across everyone who opted in. */
+  subscribers: number
+}
+
+/** The subscription shape `/api/push/subscribe` takes — the browser's `toJSON()`. */
+export interface PushSubscriptionPayload {
+  endpoint: string
+  keys: { p256dh: string; auth: string }
+}
+
 export interface Health {
   status: 'ok' | 'degraded'
   version: string
@@ -453,6 +473,8 @@ export interface Health {
     tools_enabled?: boolean
     sandbox_default?: SandboxKind
     sandboxes?: Record<string, { available: boolean; reason: string }>
+    /** Away-from-browser push: whether a VAPID key is configured, and subscriber count. */
+    push?: { configured: boolean; subscribers: number }
     error?: string
   }
 }

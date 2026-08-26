@@ -29,12 +29,14 @@ import {
 } from '../hooks/useAttention'
 import { usePoll } from '../hooks/usePoll'
 import { fullTime } from '../lib/format'
+import { disablePush, enablePush, pushSupported } from '../lib/push'
 import type {
   DiscoveredModels,
   Provider,
   ProviderKind,
   ProviderModel,
   ProviderTemplate,
+  PushInfo,
   Team,
   TeamRole,
 } from '../types'
@@ -214,71 +216,168 @@ export function SettingsScreen() {
 }
 
 /**
- * Whether the browser should say something when a job parks.
+ * Whether this browser should reach out when a job parks — now even with no tab open.
  *
- * The permission prompt has to come from a click, which is the whole reason this is a
- * switch on a settings screen rather than something the app asks for on load. Chrome
- * ignores a request that did not follow a gesture, and a browser that has been told
- * "block" once cannot be asked again from script at all — so the state is reported
- * plainly instead of retried.
+ * Two mechanisms behind one switch. The in-tab `announce()` (in `useAttention`) covers
+ * a tab that is open but in the background. This panel adds Web Push: a service worker
+ * plus a per-browser subscription the server fans out to, so a closed laptop or a phone
+ * is told too. The permission prompt has to follow the click — Chrome ignores one that
+ * did not, and a browser told "block" once cannot be asked again from script — so the
+ * state is reported plainly instead of retried.
  */
 function Notifications() {
   const possible = notificationsPossible()
+  const canPush = pushSupported()
   const [wanted, setWanted] = useState(notificationsWanted)
   const [permission, setPermission] = useState<NotificationPermission | 'unsupported'>(
     possible ? Notification.permission : 'unsupported',
   )
   const [asking, setAsking] = useState(false)
+  const [info, setInfo] = useState<PushInfo | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [problem, setProblem] = useState<string | null>(null)
+  const [tested, setTested] = useState<'idle' | 'sending' | 'sent' | 'empty' | 'failed'>('idle')
+
+  const refreshInfo = () => {
+    void api
+      .push()
+      .then(setInfo)
+      .catch(() => setInfo(null))
+  }
+  useEffect(refreshInfo, [])
+
+  const serverOff = info !== null && !info.configured
+  const subscribers = info?.subscribers ?? 0
 
   const toggle = async (on: boolean) => {
+    setProblem(null)
+    setTested('idle')
     setNotificationsWanted(on)
     setWanted(on)
-    if (!on || !possible || Notification.permission !== 'default') return
-    setAsking(true)
+
+    if (!on) {
+      // Untick means "stop reaching me here" — drop the background subscription so the
+      // server stops fanning out to this browser, not just the in-tab toast.
+      setBusy(true)
+      try {
+        await disablePush()
+      } catch {
+        /* best effort; a dead row is pruned server-side on its next failed send */
+      } finally {
+        setBusy(false)
+        refreshInfo()
+      }
+      return
+    }
+
+    // Turning on. The permission prompt must ride on this click.
+    let granted = possible && Notification.permission === 'granted'
+    if (possible && Notification.permission === 'default') {
+      setAsking(true)
+      try {
+        const result = await Notification.requestPermission()
+        setPermission(result)
+        granted = result === 'granted'
+      } finally {
+        setAsking(false)
+      }
+    }
+    // In-tab notifications now work off `wanted` alone. Background push is the extra
+    // step, and only where the browser and server both support it.
+    if (!granted || !canPush || serverOff) return
+
+    setBusy(true)
     try {
-      setPermission(await Notification.requestPermission())
+      const reason = await enablePush()
+      if (reason) setProblem(reason)
+    } catch {
+      setProblem('Could not subscribe this browser for push. Try again, or reload the page.')
     } finally {
-      setAsking(false)
+      setBusy(false)
+      refreshInfo()
     }
   }
 
+  const sendTest = async () => {
+    setTested('sending')
+    try {
+      const result = await api.pushTest()
+      setTested(result.sent > 0 ? 'sent' : 'empty')
+    } catch {
+      setTested('failed')
+    } finally {
+      refreshInfo()
+    }
+  }
+
+  const on = wanted && permission === 'granted'
+  const background = on && canPush && !serverOff
+
   const note = !possible
-    ? 'This browser has no notification API, so nothing will be sent.'
+    ? 'This browser has no notification API, so nothing can be sent.'
     : permission === 'denied'
       ? 'The browser is blocking notifications for this site. That has to be undone in its site settings — a page cannot ask again.'
       : permission === 'granted'
-        ? wanted
-          ? 'Granted. A notification is sent when the number of blocked jobs rises and this tab is not in front.'
-          : 'Granted, but switched off here.'
+        ? !wanted
+          ? 'Granted, but switched off here.'
+          : !canPush
+            ? 'On for an open tab. This browser cannot hold a background subscription, so it will not be told once every tab is closed.'
+            : serverOff
+              ? 'On for an open tab. Background delivery is switched off on the server (AGENT_HUB_PUSH), so a closed browser cannot be reached.'
+              : 'On. This browser is told the moment a job needs an approval or an answer, even with every tab closed — the message names the job and opens it when tapped. On iPhone, add this site to the home screen first, or it cannot receive them.'
         : 'The browser will ask once you switch this on.'
+
+  const testNote =
+    tested === 'sent'
+      ? `Sent to ${subscribers} subscribed ${subscribers === 1 ? 'browser' : 'browsers'}.`
+      : tested === 'empty'
+        ? 'Nothing was sent — no browser is subscribed yet.'
+        : tested === 'failed'
+          ? 'The test could not be sent.'
+          : `${subscribers} ${subscribers === 1 ? 'browser is' : 'browsers are'} subscribed.`
 
   return (
     <section className="panel">
       <header className="panel-head">
         <h2>Tell me when a job stops</h2>
-        <span className={`pill pill-${wanted && permission === 'granted' ? 'good' : 'muted'}`}>
-          {wanted && permission === 'granted' ? 'on' : 'off'}
-        </span>
+        <span className={`pill pill-${on ? 'good' : 'muted'}`}>{on ? 'on' : 'off'}</span>
       </header>
 
       <p className="panel-note">
         A job that parks itself on a question at two in the morning is invisible until
-        someone looks at this app. This is the only thing here that reaches out rather
-        than waiting to be read, so it fires on one signal only: the number of jobs
-        blocked on you going <em>up</em>, while you are looking at something else.
+        someone looks at this app. Switch this on and this browser — laptop or phone — is
+        told the moment a job needs you, even with the site closed. It fires on that one
+        signal only, never for anything else, and anyone who opens this site can turn it
+        on for their own device. The message lands on the lock screen, which everyone here
+        is already behind the site&apos;s password to reach.
       </p>
 
       <label className="check">
         <input
           type="checkbox"
           checked={wanted}
-          disabled={!possible || asking || permission === 'denied'}
+          disabled={!possible || asking || busy || permission === 'denied'}
           onChange={(event) => void toggle(event.target.checked)}
         />
         <span>Notify me when a job needs an answer</span>
       </label>
 
+      {problem ? <ErrorNote>{problem}</ErrorNote> : null}
       <p className="field-note">{note}</p>
+
+      {background ? (
+        <div className="form-foot">
+          <button
+            type="button"
+            className="button ghost"
+            onClick={() => void sendTest()}
+            disabled={tested === 'sending'}
+          >
+            {tested === 'sending' ? 'Sending…' : 'Send a test'}
+          </button>
+          <span className="muted">{testNote}</span>
+        </div>
+      ) : null}
     </section>
   )
 }
