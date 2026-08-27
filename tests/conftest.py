@@ -59,6 +59,7 @@ from app.orchestrator import sandbox as sandbox_mod  # noqa: E402
 from app.orchestrator import tools as tools_mod  # noqa: E402
 from app.orchestrator import usage as usage_mod  # noqa: E402
 from app.orchestrator import engine as engine_mod  # noqa: E402
+from app.orchestrator import providers as providers_mod  # noqa: E402
 from app.orchestrator.engine import TERMINAL_JOB_STATUSES  # noqa: E402
 from app.orchestrator.providers import (  # noqa: E402
     Completion,
@@ -111,7 +112,7 @@ ONE_PHASE = {
 #: Every module that imported `settings` by value and reads a limit off it. `tune`
 #: repoints all of them, because which module reads which limit is an implementation
 #: detail a test should not have to track.
-_SETTINGS_READERS = (agentloop_mod, tools_mod, sandbox_mod, engine_mod, usage_mod)
+_SETTINGS_READERS = (agentloop_mod, tools_mod, sandbox_mod, engine_mod, usage_mod, providers_mod)
 
 
 def tune(monkeypatch: pytest.MonkeyPatch, **changes: Any) -> Any:
@@ -191,6 +192,13 @@ class FakeProvider:
         self.cancelled = 0
         self.fail_after: int | None = None
         self.fail_with = "upstream returned 502"
+        #: Whether a ``fail_after`` failure is tagged retryable. Default False keeps
+        #: it fatal (the historical behaviour); True lets the outer wait-and-retry
+        #: ring see it as transient.
+        self.fail_retryable = False
+        #: Fail the next N calls with a *retryable* error, then behave normally — a
+        #: provider that blips and recovers. Decremented on each raise.
+        self.flaky = 0
         self.tool_script: list[ScriptedTurn] = []
         #: Reported on every completion, so a test can assert the ledger without a live
         #: endpoint. Deliberately the OpenAI spelling — `normalize_usage` is tested
@@ -237,8 +245,12 @@ class FakeProvider:
                 self.cancelled += 1
                 raise
 
+        if self.flaky > 0:
+            self.flaky -= 1
+            raise ProviderError(self.fail_with, retryable=True)
+
         if self.fail_after is not None and len(self.prompts) > self.fail_after:
-            raise ProviderError(self.fail_with)
+            raise ProviderError(self.fail_with, retryable=self.fail_retryable)
 
         if PLAN_MARKER in prompt:
             return Completion(text=json.dumps(self.plan), model=self.model, usage=dict(self.usage))

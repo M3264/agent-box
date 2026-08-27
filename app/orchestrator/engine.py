@@ -41,6 +41,7 @@ from app.orchestrator.providers import (
     Provider,
     ProviderError,
     ProviderPool,
+    complete_with_retry,
 )
 from app.orchestrator.roles import Role, Team, load_team
 from app.orchestrator.usage import BudgetExceeded, MeteredProvider, UsageMeter, resolve_budget
@@ -624,9 +625,9 @@ class JobEngine:
 
         try:
             if phase.kind == "plan":
-                output = await self._do_plan(job, team, provider, phase, guidance)
+                output = await self._do_plan(job, team, provider, phase, guidance, cancel)
             elif phase.kind == "synthesis":
-                output = await self._do_synthesis(job, team, provider, phase, guidance)
+                output = await self._do_synthesis(job, team, provider, phase, guidance, cancel)
             else:
                 output = await self._do_work(job, team, provider, phase, role, guidance, box, cancel)
         except asyncio.CancelledError:
@@ -768,14 +769,59 @@ class JobEngine:
     # ------------------------------------------------------------------ phase kinds
 
     async def _ask(
-        self, provider: Provider, system: str, prompt: str, temperature: float = 0.2
+        self,
+        provider: Provider,
+        system: str,
+        prompt: str,
+        *,
+        job_id: str,
+        phase: PhaseRow,
+        cancel: asyncio.Event | None = None,
+        temperature: float = 0.2,
     ) -> Completion:
-        return await provider.complete(
-            system=system, messages=[Message(role="user", content=prompt)], temperature=temperature
+        """One plain text-in/text-out model call for a phase.
+
+        Routed through ``complete_with_retry`` so a provider blip waits and tries
+        again rather than failing the phase and the job with it. Each wait drops a
+        timeline notice and parks the agent as "waiting", so a slow provider reads
+        as a delay the operator can see rather than a silent hang.
+        """
+
+        async def on_wait(attempt: int, delay: float, exc: ProviderError) -> None:
+            await self.store.record(
+                job_id,
+                "notice",
+                {
+                    "message": (
+                        f"Provider unavailable ({exc}); waiting {delay:.0f}s before "
+                        f"retrying '{phase.name}' (attempt {attempt + 1})."
+                    ),
+                    "phase_id": phase.id,
+                    "provider_retry": attempt,
+                },
+                source="system",
+            )
+            await self._set_agent(
+                job_id, phase.owner, "waiting", f"Provider unavailable — retrying in {delay:.0f}s"
+            )
+
+        return await complete_with_retry(
+            provider,
+            system=system,
+            messages=[Message(role="user", content=prompt)],
+            temperature=temperature,
+            cancel=cancel,
+            on_wait=on_wait,
         )
 
     async def _do_plan(
-        self, job: Any, team: Team, provider: Provider, phase: PhaseRow, guidance: list[str]
+        self,
+        job: Any,
+        team: Team,
+        provider: Provider,
+        phase: PhaseRow,
+        guidance: list[str],
+        cancel: asyncio.Event | None = None,
     ) -> str:
         """Manager authors the phases. Falls back to one phase per specialist."""
         job_id = job["id"]
@@ -816,7 +862,12 @@ class JobEngine:
         )
 
         completion = await self._ask(
-            provider, f"You are {team.orchestrator.name}. {team.orchestrator.instructions}", prompt
+            provider,
+            f"You are {team.orchestrator.name}. {team.orchestrator.instructions}",
+            prompt,
+            job_id=job_id,
+            phase=phase,
+            cancel=cancel,
         )
 
         notes: str | None = None
@@ -978,7 +1029,9 @@ class JobEngine:
         system = f"You are {role.name}. {role.instructions}"
 
         if box is None:
-            completion = await self._ask(provider, system, prompt)
+            completion = await self._ask(
+                provider, system, prompt, job_id=job_id, phase=phase, cancel=cancel
+            )
             text = completion.text
         else:
             loop = agentloop.ToolLoop(
@@ -1020,7 +1073,13 @@ class JobEngine:
         return text
 
     async def _do_synthesis(
-        self, job: Any, team: Team, provider: Provider, phase: PhaseRow, guidance: list[str]
+        self,
+        job: Any,
+        team: Team,
+        provider: Provider,
+        phase: PhaseRow,
+        guidance: list[str],
+        cancel: asyncio.Event | None = None,
     ) -> str:
         job_id = job["id"]
         context = self._context_block(await self._prior_outputs(job_id, phase.seq))
@@ -1036,7 +1095,12 @@ class JobEngine:
             "Write it for someone who has not seen the intermediate work."
         )
         completion = await self._ask(
-            provider, f"You are {team.orchestrator.name}. {team.orchestrator.instructions}", prompt
+            provider,
+            f"You are {team.orchestrator.name}. {team.orchestrator.instructions}",
+            prompt,
+            job_id=job_id,
+            phase=phase,
+            cancel=cancel,
         )
         await self.store.record(
             job_id, "result", {"content": completion.text}, source=team.orchestrator.id

@@ -31,7 +31,7 @@ import os
 import re
 import tomllib
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 import httpx
 
@@ -43,11 +43,26 @@ log = get_logger("agent_hub.providers")
 
 
 class ProviderError(RuntimeError):
-    """A provider call failed in a way worth surfacing to the operator."""
+    """A provider call failed in a way worth surfacing to the operator.
+
+    ``retryable`` says whether waiting could plausibly help: True for a transient
+    fault (a 5xx, a rate limit, a dropped connection, a CDN/WAF error page, a
+    timeout), False for something a wait cannot fix (a bad request, a missing
+    key). :func:`complete_with_retry` reads it to decide between waiting and
+    giving up. It defaults False so anything raised without a considered opinion
+    fails fast rather than looping.
+    """
+
+    def __init__(self, *args: object, retryable: bool = False) -> None:
+        super().__init__(*args)
+        self.retryable = retryable
 
 
 class ProviderConfigError(ProviderError):
-    """The provider profile is unusable — missing secret, no profile, etc."""
+    """The provider profile is unusable — missing secret, no profile, etc.
+
+    Never retryable: the profile is wrong, and it will still be wrong in a minute.
+    """
 
 
 #: Statuses that say "ask again later", not "your request was wrong".
@@ -532,7 +547,15 @@ class OpenAICompatibleProvider:
                 )
                 await asyncio.sleep(delay)
 
-        raise failure if failure is not None else ProviderError("provider call failed")
+        # Everything that reaches here is transient — a network error, or a
+        # status that passed the _retryable() check above — so tag it as such
+        # for the outer wait-and-retry ring. A fatal status already raised inside
+        # the loop with retryable left False.
+        if failure is None:
+            failure = ProviderError("provider call failed", retryable=True)
+        else:
+            failure.retryable = True
+        raise failure
 
     def _parse(self, response: httpx.Response) -> Completion:
         try:
@@ -669,7 +692,15 @@ class AnthropicProvider:
                 )
                 await asyncio.sleep(delay)
 
-        raise failure if failure is not None else ProviderError("provider call failed")
+        # Everything that reaches here is transient — a network error, or a
+        # status that passed the _retryable() check above — so tag it as such
+        # for the outer wait-and-retry ring. A fatal status already raised inside
+        # the loop with retryable left False.
+        if failure is None:
+            failure = ProviderError("provider call failed", retryable=True)
+        else:
+            failure.retryable = True
+        raise failure
 
     def _parse(self, response: httpx.Response) -> Completion:
         try:
@@ -1113,4 +1144,107 @@ async def complete_with_timeout(
                 system=system, messages=messages, temperature=temperature, tools=tools
             )
     except TimeoutError as exc:
-        raise ProviderError(f"provider call exceeded {limit:.0f}s") from exc
+        raise ProviderError(f"provider call exceeded {limit:.0f}s", retryable=True) from exc
+
+
+#: Told before each wait: (attempt-that-just-failed, seconds-until-retry, error).
+OnWait = Callable[[int, float, ProviderError], Awaitable[None]]
+
+
+def _provider_retry_delay(attempt: int) -> float:
+    """Seconds to wait before re-attempting a call that failed transiently.
+
+    Escalating and capped: a blip clears in the first short wait, while a longer
+    outage settles into steady re-checks rather than a busy-loop. ``attempt`` is 1
+    for the wait after the first failure, 2 after the second, and so on.
+    """
+    base = max(0.0, float(settings.provider_retry_base_delay))
+    cap = max(base, float(settings.provider_retry_max_delay))
+    return min(base * (2 ** (attempt - 1)), cap)
+
+
+async def _sleep_or_cancelled(delay: float, cancel: asyncio.Event | None) -> None:
+    """Wait ``delay`` seconds, but wake at once if ``cancel`` is set.
+
+    If ``cancel`` is (or becomes) set, raise ``CancelledError`` so a stop unwinds
+    the phase exactly as any other stop does, rather than the wait swallowing it.
+    """
+    if cancel is None:
+        await asyncio.sleep(delay)
+        return
+    if not cancel.is_set():
+        waiter = asyncio.ensure_future(cancel.wait())
+        try:
+            await asyncio.wait({waiter}, timeout=delay)
+        finally:
+            waiter.cancel()
+    if cancel.is_set():
+        raise asyncio.CancelledError()
+
+
+async def complete_with_retry(
+    provider: Provider,
+    *,
+    system: str,
+    messages: list[Message],
+    temperature: float = 0.2,
+    timeout: float | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    cancel: asyncio.Event | None = None,
+    on_wait: OnWait | None = None,
+) -> Completion:
+    """Wait out a provider outage instead of letting one blip kill a job.
+
+    ``complete()`` already retries a few-second hiccup inside a single call. This
+    is the ring beyond that: when a call still fails with a *retryable* error — a
+    5xx, a rate limit, a dropped connection, a CDN/WAF error page, a timeout — the
+    whole call is retried after an escalating wait, so a provider that is down for
+    a minute or ten costs a job time rather than the job itself. A non-retryable
+    error (a bad request, a missing key, an unusable profile) is raised at once:
+    waiting cannot fix it, and looping on it would only hide it.
+
+    Retrying here is safe the same way ``complete()``'s own retry is: a provider
+    call has no side effects. The caller's conversation is untouched, so nothing
+    already done in a tool loop is repeated — only the next turn's round-trip is
+    re-tried. That is why this wraps the *call* and never the tool loop around it.
+
+    The wait is interruptible: a set ``cancel`` (an operator stop, or shutdown)
+    ends it at once with ``CancelledError``. ``on_wait(attempt, delay, error)`` —
+    if given — is awaited before each wait so the caller can tell the operator
+    what is happening; it is guarded, so a failing notice never ends the job.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await complete_with_timeout(
+                provider,
+                system=system,
+                messages=messages,
+                temperature=temperature,
+                timeout=timeout,
+                tools=tools,
+            )
+        except ProviderError as exc:
+            exhausted = (
+                settings.provider_retry_attempts > 0
+                and attempt >= settings.provider_retry_attempts
+            )
+            if not settings.provider_retry_enabled or not exc.retryable or exhausted:
+                raise
+            delay = _provider_retry_delay(attempt)
+            log.warning(
+                "provider unavailable; waiting before another attempt",
+                extra={
+                    "provider": getattr(provider, "id", "?"),
+                    "attempt": attempt,
+                    "retry_in": delay,
+                    "error": str(exc),
+                },
+            )
+            if on_wait is not None:
+                try:
+                    await on_wait(attempt, delay, exc)
+                except Exception:  # pragma: no cover - a notice must never end a job
+                    log.warning("provider-retry wait notice failed", exc_info=True)
+            await _sleep_or_cancelled(delay, cancel)

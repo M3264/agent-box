@@ -65,6 +65,25 @@ class Settings:
     provider_timeout: int = field(default_factory=lambda: _env_int("AGENT_HUB_PROVIDER_TIMEOUT", 180))
     provider_connect_timeout: int = field(default_factory=lambda: _env_int("AGENT_HUB_PROVIDER_CONNECT_TIMEOUT", 20))
 
+    # -- surviving a provider outage ----------------------------------------
+    # A provider call already retries a few-second hiccup on its own (see
+    # MAX_ATTEMPTS in providers.py). This is the ring outside that: when a call
+    # still fails with a *transient* error — a 5xx, a rate limit, a dropped
+    # connection, a CDN/WAF error page, a timeout — the whole call is waited on
+    # and tried again, instead of failing the phase and taking the job down with
+    # it. A call is stateless, so re-trying it replays nothing already done.
+    # Errors that a wait cannot fix (a bad request, a missing key, an unusable
+    # profile) still fail at once. Off restores the old behaviour: one exhausted
+    # call ends the job.
+    provider_retry_enabled: bool = field(default_factory=lambda: _env_bool("AGENT_HUB_PROVIDER_RETRY", True))
+    #: Total attempts per call, including the first, before the phase is allowed
+    #: to fail. 0 keeps trying until the provider recovers or the job is stopped.
+    provider_retry_attempts: int = field(default_factory=lambda: _env_int("AGENT_HUB_PROVIDER_RETRY_ATTEMPTS", 20))
+    #: First wait after a failure, seconds; doubles each attempt up to the cap.
+    provider_retry_base_delay: int = field(default_factory=lambda: _env_int("AGENT_HUB_PROVIDER_RETRY_BASE", 10))
+    #: Longest wait between attempts, seconds.
+    provider_retry_max_delay: int = field(default_factory=lambda: _env_int("AGENT_HUB_PROVIDER_RETRY_MAX_DELAY", 60))
+
     # Fallback location for provider secrets, used only when the profile's
     # secret_ref is not present in the environment.
     codex_config: Path = field(default_factory=lambda: _env_path("AGENT_HUB_CODEX_CONFIG", Path.home() / ".codex" / "config.toml"))

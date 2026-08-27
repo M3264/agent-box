@@ -50,7 +50,7 @@ from app.orchestrator.providers import (
     Provider,
     ProviderError,
     ToolCallRequest,
-    complete_with_timeout,
+    complete_with_retry,
     parse_json_response,
 )
 from app.orchestrator.sandbox import _Sandbox
@@ -270,11 +270,13 @@ class ToolLoop:
                     },
                     source="operator",
                 )
-            completion = await complete_with_timeout(
+            completion = await complete_with_retry(
                 self.provider,
                 system=system,
                 messages=_trim(messages),
                 tools=tools.TOOL_SCHEMAS,
+                cancel=self.cancel,
+                on_wait=self._provider_wait_notice,
             )
 
             native = bool(completion.tool_calls)
@@ -339,7 +341,13 @@ class ToolLoop:
             },
             source="system",
         )
-        completion = await complete_with_timeout(self.provider, system=system, messages=messages)
+        completion = await complete_with_retry(
+            self.provider,
+            system=system,
+            messages=messages,
+            cancel=self.cancel,
+            on_wait=self._provider_wait_notice,
+        )
         return LoopResult(text=completion.text, turns=turn, calls=self.calls, exhausted=True)
 
     # ------------------------------------------------------------------ one call
@@ -693,6 +701,28 @@ class ToolLoop:
         await self.store.record(
             self.job_id, "agent_state", {"status": "active", "current_action": action}, source=self.agent
         )
+
+    async def _provider_wait_notice(self, attempt: int, delay: float, exc: ProviderError) -> None:
+        """Tell the operator a call is waiting out a provider blip, not failing.
+
+        Fired by ``complete_with_retry`` before each wait. The timeline notice is the
+        durable record; the action line keeps the Agents view honest so a wait reads
+        as a wait rather than a hang.
+        """
+        await self.store.record(
+            self.job_id,
+            "notice",
+            {
+                "message": (
+                    f"Provider unavailable ({exc}); waiting {delay:.0f}s before retry "
+                    f"{attempt + 1} of '{self.phase_name}'."
+                ),
+                "phase_id": self.phase_id,
+                "provider_retry": attempt,
+            },
+            source="system",
+        )
+        await self._set_action(f"Provider unavailable — retrying in {delay:.0f}s")
 
 
 async def interrupted_notice(database: Database, phase_id: int) -> str:
