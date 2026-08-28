@@ -134,6 +134,47 @@ class JobRerun(BaseModel):
         return stripped
 
 
+class JobPatch(BaseModel):
+    """Retune a job that has not finished, in place, without stopping it.
+
+    Everything settable at creation except the task itself — provider, per-agent models,
+    team, sandbox, token budget, and controlled/yolo mode — and every field is optional, so
+    the operator sends only what changes. The change lands at the next phase boundary; a
+    phase already running keeps the config it started with.
+
+    ``model_fields_set`` tells an omitted field from an explicit ``null``: omitted leaves a
+    column alone, while ``null`` resets a nullable one (provider, sandbox, budget, or team
+    → the default template) to the server default — the same two-meanings-for-one-field
+    contract the re-run form uses. ``mode`` has no null meaning and an explicit null is
+    ignored rather than blanking a NOT-NULL column.
+    """
+
+    team_id: int | None = None
+    mode: Mode | None = None
+    provider_id: str | None = None
+    sandbox: Sandbox | None = None
+    token_budget: int | None = Field(default=None, ge=0, le=1_000_000_000)
+    agents: list[AgentAssignment] | None = Field(default=None, max_length=12)
+
+    @field_validator("agents")
+    @classmethod
+    def _one_per_agent(
+        cls, agents: list[AgentAssignment] | None
+    ) -> list[AgentAssignment] | None:
+        if agents is None:
+            return None
+        names = [entry.agent for entry in agents]
+        if len(names) != len(set(names)):
+            raise ValueError("each agent may be assigned at most once")
+        return agents
+
+    @model_validator(mode="after")
+    def _something_to_change(self) -> JobPatch:
+        if not self.model_fields_set:
+            raise ValueError("send at least one field to change")
+        return self
+
+
 class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=20_000)
     agent: str = "manager"
@@ -334,6 +375,38 @@ class ProviderUpsert(BaseModel):
 
         object.__setattr__(self, "model", default)
         return self
+
+
+class ProviderSecret(BaseModel):
+    """A provider key pasted in the Settings form, on its way to the 0600 secrets file.
+
+    The one place a secret *value* is accepted over the API. It is written only to
+    ``data/provider_secrets.json`` and nowhere else — never the database, never a log
+    line, never a GET response, which masks it to the boolean ``has_saved_secret``.
+    """
+
+    value: str = Field(min_length=1, max_length=8_000)
+
+    @field_validator("value")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("secret value must not be blank")
+        return stripped
+
+
+class ProviderTest(BaseModel):
+    """Optional body for the provider Test button: which model to ping, or the default."""
+
+    model: str | None = Field(default=None, max_length=200)
+
+    @field_validator("model")
+    @classmethod
+    def _blank_is_none(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
 
 
 class TeamRole(BaseModel):

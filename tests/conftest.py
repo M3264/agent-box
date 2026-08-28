@@ -49,6 +49,7 @@ import pytest  # noqa: E402
 
 from app.config import settings  # noqa: E402
 from app.db import db  # noqa: E402
+from app import secret_store  # noqa: E402
 from app.deps import engine  # noqa: E402
 from app.events import broker, events  # noqa: E402
 from app.main import app  # noqa: E402
@@ -315,6 +316,11 @@ class FakePool:
     def __init__(self, provider: FakeProvider) -> None:
         self.provider = provider
         self.asked: list[tuple[str | None, str | None]] = []
+        #: Every job-default the engine repointed the pool at, in order. The engine calls
+        #: ``set_default_provider`` at every phase boundary (with the unchanged id when
+        #: nothing was retuned), so this records the switch a mid-run provider change makes.
+        self.defaults: list[str | None] = []
+        self.default_provider_id: str | None = None
         self.entered = 0
 
     async def __aenter__(self) -> FakePool:
@@ -332,6 +338,16 @@ class FakePool:
     ) -> FakeProvider:
         self.asked.append((provider_id, model))
         return self.provider
+
+    def set_default_provider(self, provider_id: str | None) -> None:
+        """Mirror the real pool's mid-run repoint so ``_reload_config`` can call it.
+
+        The engine repoints the pool at every phase boundary; recording each one lets a
+        retune test assert the pool was actually pointed at the switched-in provider, over
+        and above seeing the resolved ids land in ``asked``.
+        """
+        self.default_provider_id = provider_id
+        self.defaults.append(provider_id)
 
 
 @pytest.fixture
@@ -364,6 +380,11 @@ def patch_provider(
 async def database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIterator[None]:
     """Run the real application lifespan against a per-test database."""
     monkeypatch.setattr(db, "path", tmp_path / "agent-hub.db")
+    # The secrets file is derived from `settings.db_path`, which is frozen at import and
+    # does not follow the per-test `db.path` above. Repoint the store's live path resolver
+    # so a key saved in one test can never leak into the next (and no test touches real
+    # `data/`), which is the isolation the `provider_secrets_file` docstring promises.
+    monkeypatch.setattr(secret_store, "_path", lambda: tmp_path / "provider_secrets.json")
 
     async with app.router.lifespan_context(app):
         await db.execute(

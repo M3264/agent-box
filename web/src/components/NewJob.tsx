@@ -41,9 +41,15 @@ interface Props {
   onClose: () => void
   /** Prefill from an existing job and submit as a re-run of it. */
   seed?: JobSeed | null
+  /**
+   * Retune the seeded job in place instead of re-running it: the task is out of scope
+   * (it is the job's identity), the form submits to `PATCH /jobs/{id}`, and the change
+   * lands at the next phase boundary. Requires `seed`.
+   */
+  editing?: boolean
 }
 
-export function NewJob({ open, onClose, seed }: Props) {
+export function NewJob({ open, onClose, seed, editing = false }: Props) {
   const navigate = useNavigate()
   const [task, setTask] = useState('')
   const [mode, setMode] = useState<Mode>('controlled')
@@ -172,7 +178,7 @@ export function NewJob({ open, onClose, seed }: Props) {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
-    if (!task.trim() || busy) return
+    if ((!editing && !task.trim()) || busy) return
     setBusy(true)
     setError(null)
 
@@ -193,6 +199,25 @@ export function NewJob({ open, onClose, seed }: Props) {
 
     try {
       const capped = budget.trim() === '' ? null : Math.max(0, Math.round(Number(budget)))
+      if (editing) {
+        // A live retune, not a new job: every field the create form sets except the
+        // task. An explicit null resets a nullable back to the server default, exactly
+        // as re-run does — the server applies it at the next phase boundary.
+        if (!seed) {
+          setBusy(false)
+          return
+        }
+        await api.patchJobConfig(seed.from, {
+          mode,
+          team_id: teamId === '' ? null : teamId,
+          provider_id: providerId || null,
+          sandbox: sandbox || null,
+          token_budget: capped,
+          agents,
+        })
+        onClose()
+        return
+      }
       const created = seed
         ? // Every field is sent explicitly, including nulls: the form shows the
           // inherited settings, so leaving one as "server default" has to actually
@@ -218,7 +243,7 @@ export function NewJob({ open, onClose, seed }: Props) {
       onClose()
       void navigate(`/jobs/${created.id}`)
     } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : 'could not create the job')
+      setError(cause instanceof ApiError ? cause.message : editing ? 'could not update the job' : 'could not create the job')
       setBusy(false)
     }
   }
@@ -229,11 +254,17 @@ export function NewJob({ open, onClose, seed }: Props) {
   return (
     <div className="modal-root">
       <button type="button" className="drawer-scrim" aria-label="Cancel" onClick={onClose} />
-      <form className="modal" onSubmit={submit} aria-label={seed ? 'Run again' : 'New job'}>
+      <form className="modal" onSubmit={submit} aria-label={editing ? 'Edit configuration' : seed ? 'Run again' : 'New job'}>
         <header className="modal-head">
           <div>
-            <h2>{seed ? 'Run again' : 'New job'}</h2>
-            {seed ? (
+            <h2>{editing ? 'Edit configuration' : seed ? 'Run again' : 'New job'}</h2>
+            {editing ? (
+              <p className="modal-sub">
+                Retuning <code>{seed?.from}</code> — the change applies at the next phase
+                boundary, never mid-phase. The task can&apos;t change here; use Run again for
+                that.
+              </p>
+            ) : seed ? (
               <p className="modal-sub">
                 Forked from <code>{seed.from}</code> — change what should differ, the rest is
                 inherited.
@@ -246,17 +277,19 @@ export function NewJob({ open, onClose, seed }: Props) {
         </header>
 
         <div className="modal-body">
-          <label className="field">
-            <span>Task</span>
-            <textarea
-              value={task}
-              onChange={(event) => setTask(event.target.value)}
-              placeholder="What should the team deliver?"
-              rows={5}
-              autoFocus
-              required
-            />
-          </label>
+          {!editing ? (
+            <label className="field">
+              <span>Task</span>
+              <textarea
+                value={task}
+                onChange={(event) => setTask(event.target.value)}
+                placeholder="What should the team deliver?"
+                rows={5}
+                autoFocus
+                required
+              />
+            </label>
+          ) : null}
 
           <div className="field-row">
             <label className="field">
@@ -508,8 +541,16 @@ export function NewJob({ open, onClose, seed }: Props) {
           <button type="button" className="button ghost" onClick={onClose}>
             Cancel
           </button>
-          <button type="submit" className="button primary" disabled={busy || !task.trim()}>
-            {busy ? 'Starting…' : seed ? 'Run again' : 'Start job'}
+          <button type="submit" className="button primary" disabled={busy || (!editing && !task.trim())}>
+            {busy
+              ? editing
+                ? 'Applying…'
+                : 'Starting…'
+              : editing
+                ? 'Apply changes'
+                : seed
+                  ? 'Run again'
+                  : 'Start job'}
           </button>
         </footer>
       </form>

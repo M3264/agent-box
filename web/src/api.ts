@@ -18,6 +18,7 @@ import type {
   InboxApproval,
   JobAction,
   JobMessage,
+  JobPatchPayload,
   JobSnapshot,
   JobSummary,
   JobUsage,
@@ -26,6 +27,7 @@ import type {
   Provider,
   ProviderKind,
   ProviderTemplate,
+  ProviderTestResult,
   PushInfo,
   PushSubscriptionPayload,
   Question,
@@ -176,6 +178,13 @@ export const api = {
       token_budget?: number | null
     } = {},
   ) => request<{ id: string; forked_from: string }>(`/api/jobs/${id}/rerun`, body(payload)),
+  /**
+   * Retune a job that has not finished, in place — everything New Job sets except the
+   * task. The server applies it at the next phase boundary, so a running phase is never
+   * disturbed. Every field is optional; an explicit `null` clears a nullable one.
+   */
+  patchJobConfig: (id: string, payload: JobPatchPayload) =>
+    request<JobSummary>(`/api/jobs/${id}`, patch(payload)),
 
   toolCalls: (id: string, phaseId?: number) =>
     request<ToolCall[]>(
@@ -206,7 +215,7 @@ export const api = {
   providers: () => request<Provider[]>('/api/providers'),
   providerKinds: () => request<ProviderKind[]>('/api/provider-kinds'),
   providerTemplates: () => request<ProviderTemplate[]>('/api/provider-templates'),
-  saveProvider: (profile: Omit<Provider, 'secret_ok' | 'created_at'>) =>
+  saveProvider: (profile: Omit<Provider, 'secret_ok' | 'has_saved_secret' | 'created_at'>) =>
     request<Provider>(`/api/providers/${profile.id}`, {
       method: 'PUT',
       body: JSON.stringify(profile),
@@ -214,6 +223,29 @@ export const api = {
   /** Ask the endpoint what it serves. Saves nothing; the operator picks. */
   discoverModels: (id: string) =>
     request<DiscoveredModels>(`/api/providers/${id}/models/discover`, { method: 'POST' }),
+  /**
+   * Store a provider's API key, pasted in the form, in the server's protected file. The
+   * value goes only here — never the database, never a GET, never a log. The response is
+   * masked to booleans re-derived from the server side, so it confirms the key resolves
+   * without ever echoing it.
+   */
+  saveProviderSecret: (id: string, value: string) =>
+    request<{ id: string; has_saved_secret: boolean; secret_ok: boolean | null }>(
+      `/api/providers/${id}/secret`,
+      { method: 'PUT', body: JSON.stringify({ value }) },
+    ),
+  /** Forget a pasted key; the profile falls back to its `secret_ref`, if any. */
+  clearProviderSecret: (id: string) =>
+    request<{ id: string; cleared: boolean; has_saved_secret: boolean; secret_ok: boolean | null }>(
+      `/api/providers/${id}/secret`,
+      { method: 'DELETE' },
+    ),
+  /**
+   * Make one real call to confirm a provider and model actually answer. Validates a
+   * just-pasted key end to end; 400 for a missing/unresolved key, 502 for a bad endpoint.
+   */
+  testProvider: (id: string, model?: string) =>
+    request<ProviderTestResult>(`/api/providers/${id}/test`, body(model ? { model } : {})),
   deleteProvider: (id: string) =>
     request<{ deleted: boolean; disabled: boolean; jobs: number }>(`/api/providers/${id}`, {
       method: 'DELETE',

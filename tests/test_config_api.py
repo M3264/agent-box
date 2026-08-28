@@ -228,3 +228,153 @@ async def test_default_team_is_used_when_a_job_omits_one(client: httpx.AsyncClie
     await wait_for_job(job_id, "complete")
 
     assert (await client.post("/api/teams/999/default")).status_code == 404
+
+
+# ------------------------------------------------------- web-pasted provider keys
+
+
+async def test_a_pasted_key_authenticates_but_is_masked_everywhere(
+    client: httpx.AsyncClient,
+) -> None:
+    """The one secret this app takes inbound: it authenticates the profile and is then
+    only ever reported as booleans — never echoed by the save call, a GET, or the DB."""
+    await client.put(
+        "/api/providers/web",
+        json={
+            "id": "web",
+            "label": "Web-added",
+            "base_url": "https://api.example.com/v1",
+            "model": "gpt-test",
+        },
+    )
+    # No ref and no saved key: the profile needs no secret, so secret_ok is null (which is
+    # a different statement from False — "none required" is not "required but broken").
+    before = {item["id"]: item for item in (await client.get("/api/providers")).json()}["web"]
+    assert before["secret_ok"] is None
+    assert before["has_saved_secret"] is False
+
+    saved = await client.put("/api/providers/web/secret", json={"value": SECRET_VALUE})
+    assert saved.status_code == 200
+    assert saved.json() == {"id": "web", "has_saved_secret": True, "secret_ok": True}
+    assert SECRET_VALUE not in saved.text, "the save call must not echo the key back"
+
+    listed = await client.get("/api/providers")
+    assert SECRET_VALUE not in listed.text
+    web = {item["id"]: item for item in listed.json()}["web"]
+    assert web["has_saved_secret"] is True
+    assert web["secret_ok"] is True, "a stored key that resolves reads as OK"
+
+    stored = await db.fetch_all("select * from provider_profiles where id='web'")
+    assert SECRET_VALUE not in json.dumps([dict(row) for row in stored]), (
+        "a pasted key must never reach the database"
+    )
+
+    cleared = await client.delete("/api/providers/web/secret")
+    assert cleared.json() == {
+        "id": "web",
+        "cleared": True,
+        "has_saved_secret": False,
+        "secret_ok": None,
+    }
+    after = {item["id"]: item for item in (await client.get("/api/providers")).json()}["web"]
+    assert after["has_saved_secret"] is False
+    assert after["secret_ok"] is None, "cleared and ref-less, the profile needs no secret again"
+
+
+async def test_a_pasted_key_fixes_a_ref_that_resolves_nowhere(client: httpx.AsyncClient) -> None:
+    """A profile whose env ref is unset reads as broken until a key is pasted for it."""
+    await client.put(
+        "/api/providers/needs",
+        json={
+            "id": "needs",
+            "label": "Needs a key",
+            "base_url": "https://api.example.com/v1",
+            "model": "gpt-test",
+            "secret_ref": "UNSET_ENV_VAR",
+        },
+    )
+    broken = {item["id"]: item for item in (await client.get("/api/providers")).json()}["needs"]
+    assert broken["secret_ok"] is False, "a named ref that resolves nowhere is reported broken"
+
+    await client.put("/api/providers/needs/secret", json={"value": SECRET_VALUE})
+    fixed = {item["id"]: item for item in (await client.get("/api/providers")).json()}["needs"]
+    assert fixed["secret_ok"] is True, "the pasted key resolves even though the env var is unset"
+    assert fixed["has_saved_secret"] is True
+
+
+async def test_secret_endpoints_require_a_real_provider(client: httpx.AsyncClient) -> None:
+    assert (await client.put("/api/providers/ghost/secret", json={"value": "x"})).status_code == 404
+    assert (await client.delete("/api/providers/ghost/secret")).status_code == 404
+
+
+async def test_a_pasted_key_may_not_be_blank(client: httpx.AsyncClient) -> None:
+    await client.put(
+        "/api/providers/blankable",
+        json={"id": "blankable", "label": "B", "base_url": "https://b.example.com/v1", "model": "m"},
+    )
+    empty = await client.put("/api/providers/blankable/secret", json={"value": ""})
+    spaces = await client.put("/api/providers/blankable/secret", json={"value": "   "})
+    assert empty.status_code == 422
+    assert spaces.status_code == 422, "a whitespace-only key is not a key"
+
+
+# --------------------------------------------------------- the provider test call
+
+
+async def test_test_endpoint_reports_a_working_provider(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    pool,
+    provider: FakeProvider,
+) -> None:
+    """One cheap real call, mapped to a green result with the model that answered."""
+    from app.api import config as config_mod
+
+    monkeypatch.setattr(config_mod, "ProviderPool", lambda *a, **kw: pool)
+    result = await client.post("/api/providers/fake/test")
+    assert result.status_code == 200
+    body = result.json()
+    assert body["ok"] is True
+    assert body["model"] == provider.model
+    assert isinstance(body["latency_ms"], int) and body["latency_ms"] >= 0
+    assert provider.prompts == ["ping"], "the test sends exactly one cheap ping"
+
+
+async def test_test_endpoint_maps_a_bad_endpoint_to_502(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    pool,
+    provider: FakeProvider,
+) -> None:
+    from app.api import config as config_mod
+
+    provider.fail_after = 0  # raise ProviderError on the first (and only) call
+    monkeypatch.setattr(config_mod, "ProviderPool", lambda *a, **kw: pool)
+    result = await client.post("/api/providers/fake/test")
+    assert result.status_code == 502, "an endpoint that answers badly is a 502, not a 500"
+    assert SECRET_VALUE not in result.text
+
+
+async def test_test_endpoint_maps_an_unresolved_key_to_400(client: httpx.AsyncClient) -> None:
+    """A named ref that resolves nowhere is a 400 the operator can fix in the form.
+
+    Deliberately uses the real pool: building the adapter calls ``resolve_secret``, which
+    raises before any network, so the 400 path is reached without a fake or a live call.
+    """
+    await client.put(
+        "/api/providers/keyless",
+        json={
+            "id": "keyless",
+            "label": "Keyless",
+            "base_url": "https://api.example.com/v1",
+            "model": "gpt-test",
+            "secret_ref": "NO_SUCH_ENV_VAR",
+        },
+    )
+    result = await client.post("/api/providers/keyless/test")
+    assert result.status_code == 400
+
+
+async def test_test_endpoint_404_for_a_missing_provider(client: httpx.AsyncClient) -> None:
+    assert (await client.post("/api/providers/ghost/test")).status_code == 404
+

@@ -13,6 +13,7 @@ never written to the database or returned by the API.
 from __future__ import annotations
 
 import json
+import time
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Path
@@ -20,13 +21,17 @@ from sqlite3 import IntegrityError
 
 from app.deps import db
 from app.logging_setup import get_logger
-from app.models import ProviderUpsert, TemplateCreate
+from app.models import ProviderSecret, ProviderTest, ProviderUpsert, TemplateCreate
 from app.config import settings
+from app import secret_store
 from app.orchestrator.providers import (
     PROVIDER_KINDS,
     PROVIDER_TEMPLATES,
+    Message,
     ProviderConfigError,
     ProviderError,
+    ProviderPool,
+    complete_with_timeout,
     discover_models,
     resolve_secret,
 )
@@ -60,12 +65,31 @@ async def _models_for(provider_id: str) -> list[dict[str, Any]]:
     ]
 
 
+def _secret_state(secret_ref: str | None, provider_id: str) -> tuple[bool, bool | None]:
+    """``(has_saved_secret, secret_ok)`` for a profile, without ever exposing the value.
+
+    ``has_saved_secret`` reports whether a key was pasted into the 0600 store; ``secret_ok``
+    is None when the provider needs no secret (none named, none saved), else whether one
+    actually resolves. Both are booleans the Settings screen can render without ever seeing
+    the key itself.
+    """
+    has_saved = secret_store.get_secret(provider_id) is not None
+    if not secret_ref and not has_saved:
+        return has_saved, None
+    try:
+        return has_saved, bool(resolve_secret(secret_ref, provider_id))
+    except ProviderConfigError:
+        return has_saved, False
+
+
 def _provider_dict(row: Any) -> dict[str, Any]:
     """Shape a profile for the API — reference only, never the secret itself.
 
     ``secret_ok`` answers the question the Settings screen actually has ("will a job
     using this profile authenticate?") without exposing the value: a misconfigured
     ``secret_ref`` is otherwise only discoverable by watching a job fail.
+    ``has_saved_secret`` reports whether a key was pasted into the 0600 store, so the form
+    can show a stored-key state and offer to clear it — again without the value.
     """
     profile = dict(row)
     try:
@@ -74,14 +98,9 @@ def _provider_dict(row: Any) -> dict[str, Any]:
         profile["headers"] = {}
     profile["enabled"] = bool(profile.get("enabled"))
     profile["supports_tools"] = bool(profile.get("supports_tools", 1))
-
-    if profile.get("secret_ref"):
-        try:
-            profile["secret_ok"] = bool(resolve_secret(profile["secret_ref"], profile["id"]))
-        except ProviderConfigError:
-            profile["secret_ok"] = False
-    else:
-        profile["secret_ok"] = None  # no secret required
+    profile["has_saved_secret"], profile["secret_ok"] = _secret_state(
+        profile.get("secret_ref"), profile["id"]
+    )
     return profile
 
 
@@ -213,6 +232,50 @@ async def discover_provider_models(provider_id: ProviderId) -> dict[str, Any]:
     }
 
 
+@router.post("/providers/{provider_id}/test")
+async def test_provider(
+    provider_id: ProviderId, payload: ProviderTest | None = None
+) -> dict[str, Any]:
+    """Make one cheap real call to confirm a provider + model actually answer.
+
+    Discover only lists models (a plain GET); this drives a completion end to end through
+    ``resolve_secret``, so a just-pasted key is validated for real rather than at the first
+    job that uses it. Read-only: it writes nothing and runs a single short call.
+
+    Errors map like discover: a missing or unresolved key is a 400 the operator can fix in
+    the form; an endpoint that answers badly is a 502; success returns the model that
+    replied and how long the round-trip took. The secret is never echoed.
+    """
+    if not await db.exists("select 1 from provider_profiles where id=?", (provider_id,)):
+        raise HTTPException(status_code=404, detail="provider not found")
+
+    model = payload.model if payload else None
+    try:
+        async with ProviderPool(db, default_provider_id=provider_id) as pool:
+            provider = await pool.get(provider_id, model)
+            started = time.perf_counter()
+            completion = await complete_with_timeout(
+                provider,
+                system="",
+                messages=[Message(role="user", content="ping")],
+                # A generous ceiling: a healthy endpoint answers a one-word ping in a
+                # second or two, and a stuck one should not hold the button forever.
+                timeout=min(float(settings.provider_timeout), 60.0),
+            )
+            latency_ms = int((time.perf_counter() - started) * 1000)
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ProviderError as exc:
+        # 502, not 500: the endpoint answered badly or not at all, exactly as discover.
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    log.info(
+        "provider tested",
+        extra={"provider": provider_id, "model": completion.model, "latency_ms": latency_ms},
+    )
+    return {"ok": True, "model": completion.model, "latency_ms": latency_ms}
+
+
 @router.delete("/providers/{provider_id}")
 async def delete_provider(provider_id: ProviderId) -> dict[str, Any]:
     """Delete a profile, or disable it if jobs still reference it.
@@ -248,6 +311,55 @@ async def delete_provider(provider_id: ProviderId) -> dict[str, Any]:
         await db.execute("update provider_profiles set enabled=0 where id=?", (provider_id,))
         return {"id": provider_id, "deleted": False, "disabled": True, "jobs": in_use}
     return {"id": provider_id, "deleted": True, "disabled": False, "jobs": 0}
+
+
+@router.put("/providers/{provider_id}/secret")
+async def save_provider_secret(provider_id: ProviderId, payload: ProviderSecret) -> dict[str, Any]:
+    """Store a provider's API key, pasted in the Settings form, in the 0600 secrets file.
+
+    The only endpoint that accepts a secret *value*. It is written to
+    ``data/provider_secrets.json`` and nowhere else — never the database, never a log line
+    (only the provider id and the action are logged), never a GET response. A job using
+    this profile then authenticates through ``resolve_secret`` with no env var or codex
+    entry required. The response is re-derived from ``resolve_secret``, so it confirms the
+    stored key actually resolves without ever echoing it.
+    """
+    row = await db.fetch_one(
+        "select id,secret_ref from provider_profiles where id=?", (provider_id,)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="provider not found")
+
+    secret_store.set_secret(provider_id, payload.value)
+    has_saved, secret_ok = _secret_state(row["secret_ref"], provider_id)
+    log.info("provider secret saved", extra={"provider": provider_id, "secret_ok": secret_ok})
+    return {"id": provider_id, "has_saved_secret": has_saved, "secret_ok": secret_ok}
+
+
+@router.delete("/providers/{provider_id}/secret")
+async def clear_provider_secret(provider_id: ProviderId) -> dict[str, Any]:
+    """Forget a pasted key.
+
+    The profile then falls back to whatever ``secret_ref`` names in the environment or
+    codex config, if anything — so clearing a key on a profile that also has an env var is
+    harmless, and clearing the only credential leaves the profile unauthenticated (which
+    ``secret_ok`` then reports).
+    """
+    row = await db.fetch_one(
+        "select id,secret_ref from provider_profiles where id=?", (provider_id,)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="provider not found")
+
+    cleared = secret_store.clear_secret(provider_id)
+    has_saved, secret_ok = _secret_state(row["secret_ref"], provider_id)
+    log.info("provider secret cleared", extra={"provider": provider_id, "had_secret": cleared})
+    return {
+        "id": provider_id,
+        "cleared": cleared,
+        "has_saved_secret": has_saved,
+        "secret_ok": secret_ok,
+    }
 
 
 # ------------------------------------------------------------------------ sandbox

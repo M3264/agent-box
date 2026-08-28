@@ -20,6 +20,7 @@ from app.models import (
     JobAction,
     JobContinue,
     JobCreate,
+    JobPatch,
     JobRerun,
     MessageCreate,
     MessageUpdate,
@@ -788,14 +789,102 @@ async def get_usage(job_id: JobId) -> dict[str, Any]:
     return await job_usage(db, job_id)
 
 
+@router.patch("/{job_id}")
+async def patch_job(job_id: JobId, payload: JobPatch) -> dict[str, Any]:
+    """Retune a job that has not finished — provider, per-agent models, team, sandbox,
+    token budget, or controlled/yolo mode — without stopping it.
+
+    Validated with the very same helpers as job creation (``_check_provider``,
+    ``_validate_assignments``, the sandbox-availability probe), so a bad switch is a 400
+    here rather than a job that dies three phases in. Only the fields actually sent are
+    written; an explicit ``null`` resets a nullable one to the server default. The change
+    lands at the next phase boundary — a queued job reads it when it starts, a running one
+    at its next phase, a paused one on resume — so a phase already in flight keeps the
+    config it began with. Rerun, not this, is the tool for a finished job.
+    """
+    job = await require_job(job_id)
+    if job["status"] in TERMINAL_JOB_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"job is {job['status']}; use rerun to start a fresh job from it",
+        )
+
+    fields = payload.model_fields_set
+
+    # Resolve the *effective* team and provider — the new value if sent, else what the job
+    # already runs with — so the assignment check runs against the configuration the job
+    # will actually have, exactly as _spawn_job validates before a job exists.
+    resolved_team = (
+        await resolve_team_id(db, payload.team_id) if "team_id" in fields else int(job["team_id"])
+    )
+    effective_provider = payload.provider_id if "provider_id" in fields else job["provider_id"]
+
+    if "provider_id" in fields:
+        # Skips a null (which means "server default", resolved when the job runs) just as
+        # _check_provider does; only re-checked when the provider is actually changing, so
+        # an unrelated edit is not blocked by a provider disabled since the job started.
+        await _check_provider(payload.provider_id, where="for the job")
+    if payload.agents is not None:
+        team = await load_team(db, resolved_team)
+        await _validate_assignments(team, effective_provider, payload.agents)
+    if "sandbox" in fields and payload.sandbox is not None:
+        state = sandbox_status().get(payload.sandbox)
+        if state is not None and not state.available:
+            raise HTTPException(
+                status_code=400,
+                detail=f"the '{payload.sandbox}' sandbox is not available on this host: {state.reason}",
+            )
+
+    # Write only the columns actually sent. team_id is stored resolved (like _spawn_job),
+    # so the row always names a real template. mode has no null meaning, so an explicit
+    # null is skipped rather than blanking a NOT-NULL column.
+    sets: list[str] = []
+    args: list[Any] = []
+    if "team_id" in fields:
+        sets.append("team_id=?")
+        args.append(resolved_team)
+    if "mode" in fields and payload.mode is not None:
+        sets.append("mode=?")
+        args.append(payload.mode)
+    if "provider_id" in fields:
+        sets.append("provider_id=?")
+        args.append(payload.provider_id)
+    if "sandbox" in fields:
+        sets.append("sandbox=?")
+        args.append(payload.sandbox)
+    if "token_budget" in fields:
+        sets.append("token_budget=?")
+        args.append(payload.token_budget)
+
+    async with db.transaction() as conn:
+        if sets:
+            sets.append("updated_at=unixepoch('subsec')")
+            await conn.execute(f"update jobs set {','.join(sets)} where id=?", (*args, job_id))
+        if payload.agents is not None:
+            # Replace-semantics: the sent list is the whole set of per-agent overrides now,
+            # so a cleared row disappears rather than lingering from an earlier config.
+            await conn.execute("delete from job_agent_providers where job_id=?", (job_id,))
+            await _write_assignments(conn, job_id, payload.agents)
+
+    await events.record(
+        job_id,
+        "notice",
+        {"message": "Configuration updated; applies at the next phase.", "config": True},
+        source="operator",
+    )
+    log.info("job config patched", extra={"job_id": job_id, "fields": sorted(fields)})
+    return _job_dict(await require_job(job_id))
+
+
 @router.patch("/{job_id}/budget")
 async def set_budget(job_id: JobId, payload: BudgetUpdate) -> dict[str, Any]:
     """Raise, lower, or remove this job's token cap.
 
-    A running job picks the new cap up on its next provider call, because the meter that
-    enforces it is re-read from this row each round — lowering it below what has already
-    been spent therefore stops the job at its next call rather than retroactively, which
-    is the only thing it could honestly do.
+    A running job picks the new cap up at its next phase boundary, where the meter that
+    enforces it is re-read from this row; lowering it below what has already been spent
+    therefore stops the job at the next call after that boundary rather than retroactively,
+    which is the only thing it could honestly do. (``PATCH /{job_id}`` changes the same
+    column; this endpoint stays as the one-field shortcut the budget control uses.)
     """
     await require_job(job_id)
     await db.execute(

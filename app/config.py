@@ -166,6 +166,13 @@ class Settings:
         into the real ``data/``."""
         return self.db_path.parent / "vapid.json"
 
+    @property
+    def provider_secrets_file(self) -> Path:
+        """Where keys pasted in the Settings form are stored, beside the database at
+        mode 0600. Like ``vapid_file``, a test that repoints the DB gets an isolated
+        store for free, so it never writes into the real ``data/``."""
+        return self.db_path.parent / "provider_secrets.json"
+
     def ensure_dirs(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.workspace_root.mkdir(parents=True, exist_ok=True)

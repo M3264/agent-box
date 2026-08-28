@@ -329,6 +329,24 @@ export interface JobSeed {
   agents: AgentProvider[]
 }
 
+/**
+ * A live retune of a job that has not finished — everything New Job sets except the
+ * task itself. Sent by Edit config; the server applies it at the next phase boundary,
+ * never mid-phase.
+ *
+ * Every field is optional so only what changes is sent. An explicit `null` clears a
+ * nullable field back to the server default (provider, sandbox, budget → the default;
+ * `team_id` → the default template), exactly as the re-run form does.
+ */
+export interface JobPatchPayload {
+  mode?: Mode
+  team_id?: number | null
+  provider_id?: string | null
+  sandbox?: SandboxKind | null
+  token_budget?: number | null
+  agents?: AgentProvider[]
+}
+
 export interface JobSnapshot
   extends Omit<
     JobSummary,
@@ -409,8 +427,14 @@ export interface Provider {
   headers: Record<string, string>
   enabled: boolean
   supports_tools: boolean
-  /** Whether `secret_ref` resolves server-side; null when none is needed. */
+  /** Whether the profile's credential resolves server-side; null when none is needed. */
   secret_ok: boolean | null
+  /**
+   * Whether a key was pasted into the server's protected store for this profile. The
+   * value never leaves the server — this boolean is all the UI is told, so it can show a
+   * stored-key state and offer to clear it.
+   */
+  has_saved_secret: boolean
   created_at: number
 }
 
@@ -419,6 +443,15 @@ export interface DiscoveredModels {
   provider_id: string
   count: number
   models: { model: string; label: string | null; known: boolean }[]
+}
+
+/** The result of one live test call against a provider and model. */
+export interface ProviderTestResult {
+  ok: boolean
+  /** The model that actually answered, as the endpoint reported it. */
+  model: string
+  /** Round-trip time of the single ping, in milliseconds. */
+  latency_ms: number
 }
 
 export interface TeamRole {

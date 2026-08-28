@@ -20,7 +20,7 @@
  * refetches nor drops the live stream.
  */
 
-import { useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Link, useLocation, useParams } from 'react-router-dom'
 import { ApiError, api } from '../api'
 import { NewJob } from '../components/NewJob'
@@ -60,10 +60,32 @@ export function JobScreen() {
   const [acting, setActing] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [seed, setSeed] = useState<JobSeed | null>(null)
+  const [editing, setEditing] = useState(false)
   const [filter, setFilter] = useState<StreamFilter>('all')
   const [phase, setPhase] = useState<number | null>(null)
+  // The task title is clamped to a few lines so a long one can't grow the header tall
+  // enough to starve the conversation below it. `overflowing` gates the toggle; it is
+  // only true when the clamped box actually hides text.
+  const titleRef = useRef<HTMLHeadingElement>(null)
+  const [expanded, setExpanded] = useState(false)
+  const [overflowing, setOverflowing] = useState(false)
 
   const { panel, open } = panelFromPath(pathname)
+
+  // A different job opening in place resets the clamp, so the next measure runs against
+  // the new task rather than inheriting the last one's expanded state.
+  useEffect(() => {
+    setExpanded(false)
+  }, [job?.task])
+
+  // Measure while the clamp is applied: scrollHeight is the full text height, clientHeight
+  // the clamped box. Only compare when collapsed — expanded, there is no clamp to measure.
+  useLayoutEffect(() => {
+    if (expanded) return
+    const el = titleRef.current
+    if (!el) return
+    setOverflowing(el.scrollHeight > el.clientHeight + 1)
+  }, [job?.task, expanded])
 
   const act = async (name: 'pause' | 'resume' | 'stop') => {
     setActing(name)
@@ -94,23 +116,48 @@ export function JobScreen() {
   const queued = job.messages.filter(
     (message) => message.role === 'operator' && message.consumed_at === null,
   )
-  const openRerun = () =>
-    setSeed({
-      from: job.id,
-      task: job.task,
-      mode: job.mode,
-      team_id: job.team_id,
-      provider_id: job.provider_id,
-      sandbox: job.sandbox,
-      token_budget: job.token_budget,
-      agents: job.agent_providers,
-    })
+  // The same snapshot feeds both "run again" (a fresh forked job) and "edit config" (a
+  // live retune of this one). Built here because both need every current setting.
+  const seedFromJob = (): JobSeed => ({
+    from: job.id,
+    task: job.task,
+    mode: job.mode,
+    team_id: job.team_id,
+    provider_id: job.provider_id,
+    sandbox: job.sandbox,
+    token_budget: job.token_budget,
+    agents: job.agent_providers,
+  })
+  const openRerun = () => {
+    setEditing(false)
+    setSeed(seedFromJob())
+  }
+  const openEdit = () => {
+    setEditing(true)
+    setSeed(seedFromJob())
+  }
+  const closeForm = () => {
+    setSeed(null)
+    setEditing(false)
+    void refresh()
+  }
 
   return (
     <section className="console" data-inspecting={open ? 'true' : 'false'}>
       <header className="console-head">
         <div className="console-title">
-          <h1>{job.task}</h1>
+          <h1 ref={titleRef} className={expanded ? '' : 'is-clamped'}>
+            {job.task}
+          </h1>
+          {overflowing || expanded ? (
+            <button
+              type="button"
+              className="console-title-more"
+              onClick={() => setExpanded((value) => !value)}
+            >
+              {expanded ? 'Show less' : 'Show more'}
+            </button>
+          ) : null}
           <p className="console-meta">
             <StatusPill status={job.status} />
             {job.paused ? <span className="pill pill-muted">paused</span> : null}
@@ -191,6 +238,9 @@ export function JobScreen() {
               >
                 Stop
               </button>
+              <button type="button" className="button ghost" onClick={openEdit}>
+                Edit config
+              </button>
             </>
           ) : null}
           <Link
@@ -239,7 +289,7 @@ export function JobScreen() {
         />
       </div>
 
-      <NewJob open={seed !== null} seed={seed} onClose={() => setSeed(null)} />
+      <NewJob open={seed !== null} seed={seed} editing={editing} onClose={closeForm} />
     </section>
   )
 }

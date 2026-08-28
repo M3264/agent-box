@@ -380,10 +380,12 @@ class JobEngine:
 
             team = await load_team(self.db, int(job["team_id"]))
             assignments = await self._load_assignments(job_id)
-            # Resolved once, here, and deliberately before the first phase runs. If the
-            # job asked for a backend this host cannot provide, it must fail with that
-            # message rather than run a single command somewhere the operator did not
-            # choose — build_sandbox raises instead of substituting.
+            # Resolved here for the first phase; re-resolved at each phase boundary by
+            # _reload_config so a mid-run sandbox switch is honoured. The initial resolve
+            # must still fail fast: if the job asked for a backend this host cannot
+            # provide, it fails with that message rather than running a single command
+            # somewhere the operator did not choose — build_sandbox raises, never
+            # substitutes.
             box = await self._resolve_sandbox(job)
 
             await self._set_job_status(job_id, "running")
@@ -419,6 +421,23 @@ class JobEngine:
                     phase = await self._next_phase(job_id)
                     if phase is None:
                         break
+
+                    # Re-read the job's config at the phase boundary, so an operator edit
+                    # made mid-run (PATCH /jobs/{id}) takes effect from here on — never
+                    # mid-phase. Returns None when the job stopped or vanished between
+                    # phases, which ends the loop as cleanly as a stop mid-await does.
+                    reloaded = await self._reload_config(
+                        job_id,
+                        job=job,
+                        team=team,
+                        assignments=assignments,
+                        box=box,
+                        pool=pool,
+                        meter=meter,
+                    )
+                    if reloaded is None:
+                        break
+                    job, team, assignments, box = reloaded
 
                     if previous_owner and previous_owner != phase.owner:
                         await self.store.record(
@@ -469,6 +488,69 @@ class JobEngine:
                 self.db, self.store, job_id=job_id, reason=f"The job failed: {exc}"
             )
             await self.store.record(job_id, "status", {"status": "error"}, source="system")
+
+    async def _reload_config(
+        self,
+        job_id: str,
+        *,
+        job: Any,
+        team: Team,
+        assignments: dict[str, Assignment],
+        box: sandbox_mod._Sandbox | None,
+        pool: ProviderPool,
+        meter: UsageMeter,
+    ) -> tuple[Any, Team, dict[str, Assignment], sandbox_mod._Sandbox | None] | None:
+        """Re-read the job's config at a phase boundary, applying any operator edit.
+
+        Everything settable at job creation — provider, per-agent models, team, sandbox,
+        token budget, and controlled/yolo mode — can be changed on a running job through
+        ``PATCH /jobs/{id}``; the change lands here, at the next phase, never mid-phase. A
+        running phase keeps the config it started with.
+
+        Returns the refreshed ``(job, team, assignments, box)`` and mutates ``pool`` and
+        ``meter`` in place. Returns None when the job has vanished or gone terminal — an
+        operator stop between phases — which the caller treats as a clean end of the loop.
+
+        Every object this touches already flows into ``_run_phase`` as a parameter and is
+        read live downstream (``_gate`` reads ``job["mode"]``, ``resolve_choice`` reads
+        ``job["provider_id"]``, ``over_budget`` reads ``meter.budget``), so handing the
+        fresh values to the next phase is the whole mechanism — no signatures change.
+        """
+        fresh = await self.db.fetch_one("select * from jobs where id=?", (job_id,))
+        if fresh is None or fresh["status"] in TERMINAL_JOB_STATUSES:
+            return None
+
+        # Team swap: reload and re-seed job_agents for any newly-introduced role, exactly
+        # as the initial seeding does, so a new role starts 'queued' rather than absent.
+        # Phases owned by a now-missing role still resolve via team.get(owner) or
+        # team.orchestrator in _run_phase, so a swap never strands a pending phase.
+        if fresh["team_id"] != job["team_id"]:
+            team = await load_team(self.db, int(fresh["team_id"]))
+            for role in team.roles:
+                current = await self.db.fetch_value(
+                    "select status from job_agents where job_id=? and agent=?", (job_id, role.id)
+                )
+                if current is None or current in {"complete", "stopped"}:
+                    await self._set_agent(job_id, role.id, "queued", "Queued")
+
+        assignments = await self._load_assignments(job_id)
+
+        # The meter's budget is a live field — over_budget and the per-call check read it
+        # each time — so reassigning it applies from the very next model call. This is
+        # also what makes a budget lowered mid-run actually bite (and what the old
+        # set_budget docstring wrongly claimed already happened).
+        meter.budget = resolve_budget(fresh["token_budget"])
+
+        # A different provider id switches every agent inheriting the job default; the
+        # pool builds a fresh adapter for the new (provider, model) on demand.
+        pool.set_default_provider(fresh["provider_id"])
+
+        # Rebuild the sandbox only when it changed — it is a cheap stateless object, and
+        # _resolve_sandbox also rewrites the audit column when the kind is new.
+        if fresh["sandbox"] != job["sandbox"]:
+            box = await self._resolve_sandbox(fresh)
+
+        return fresh, team, assignments, box
 
     async def _resolve_sandbox(self, job: Any) -> sandbox_mod._Sandbox | None:
         """Decide where this job's commands run, and record it.
@@ -547,11 +629,12 @@ class JobEngine:
     # ---------------------------------------------------------------- phase exec
 
     async def _load_assignments(self, job_id: str) -> dict[str, Assignment]:
-        """Per-agent provider choices, read once per run.
+        """Per-agent provider choices, re-read at each phase boundary.
 
-        Read here rather than per phase so a job runs on the assignments it was created
-        with, even if the operator edits something mid-run — the same reasoning as
-        recording the resolved sandbox on the row.
+        Read fresh by ``_reload_config`` before every phase so an operator who retunes a
+        running job (PATCH /jobs/{id}) sees the change take effect at the next phase. A
+        phase already running keeps the assignments it started with — the switch is a
+        boundary event, never mid-phase.
         """
         rows = await self.db.fetch_all(
             "select agent,provider_id,model from job_agent_providers where job_id=?", (job_id,)

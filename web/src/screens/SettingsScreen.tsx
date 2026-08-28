@@ -70,6 +70,8 @@ interface ProviderDraft {
   supports_tools: boolean
   /** False for a profile being created, which is why discovery is unavailable. */
   existing: boolean
+  /** Whether a key is already stored on the server for this profile. */
+  has_saved_secret: boolean
 }
 
 const BLANK_PROVIDER: ProviderDraft = {
@@ -84,6 +86,7 @@ const BLANK_PROVIDER: ProviderDraft = {
   enabled: true,
   supports_tools: true,
   existing: false,
+  has_saved_secret: false,
 }
 
 const BLANK_ROLE: TeamRole = { id: '', name: '', instructions: '', orchestrator: false }
@@ -107,6 +110,7 @@ function toDraft(profile: Provider): ProviderDraft {
     enabled: profile.enabled,
     supports_tools: profile.supports_tools,
     existing: true,
+    has_saved_secret: profile.has_saved_secret,
   }
 }
 
@@ -134,9 +138,15 @@ function fromTemplate(template: ProviderTemplate, current: ProviderDraft): Provi
 }
 
 function secretNote(profile: Provider): { text: string; tone: string } {
-  if (!profile.secret_ref) return { text: 'no secret needed', tone: 'muted' }
-  if (profile.secret_ok) return { text: `${profile.secret_ref} resolves`, tone: 'good' }
-  return { text: `${profile.secret_ref} does not resolve`, tone: 'bad' }
+  // A key pasted into the server's store is the credential the operator set here, so it
+  // is named as "the stored key"; secret_ok stays the source of truth for whether the
+  // profile actually authenticates, across the env var, the stored key, or codex.
+  const stored = profile.has_saved_secret
+  if (!profile.secret_ref && !stored) return { text: 'no secret needed', tone: 'muted' }
+  if (profile.secret_ok) {
+    return { text: stored ? 'stored key resolves' : `${profile.secret_ref} resolves`, tone: 'good' }
+  }
+  return { text: stored ? 'stored key invalid' : `${profile.secret_ref} does not resolve`, tone: 'bad' }
 }
 
 /**
@@ -505,6 +515,11 @@ function Providers() {
   const [formError, setFormError] = useState<string | null>(null)
   const [found, setFound] = useState<DiscoveredModels | null>(null)
   const [discovering, setDiscovering] = useState(false)
+  /** The key being pasted, held only until Save key posts it and clears the field. */
+  const [keyInput, setKeyInput] = useState('')
+  const [keyBusy, setKeyBusy] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null)
 
   const providers = data ?? []
 
@@ -524,6 +539,8 @@ function Providers() {
     setDraft(next)
     setFound(null)
     setFormError(null)
+    setKeyInput('')
+    setTestResult(null)
   }
 
   const patchModel = (index: number, changes: Partial<ModelDraft>) =>
@@ -584,6 +601,65 @@ function Providers() {
       )
     } finally {
       setDiscovering(false)
+    }
+  }
+
+  // The pasted key goes straight to the protected server file and never touches the
+  // profile row; the response is masked to booleans, so we mirror those onto the draft
+  // and drop the plaintext from state at once.
+  const saveKey = async () => {
+    if (!draft || !draft.existing || !keyInput.trim() || keyBusy) return
+    setKeyBusy(true)
+    setFormError(null)
+    setTestResult(null)
+    try {
+      const result = await api.saveProviderSecret(draft.id, keyInput)
+      setDraft((current) =>
+        current ? { ...current, has_saved_secret: result.has_saved_secret } : current,
+      )
+      setKeyInput('')
+      await reload()
+    } catch (cause) {
+      setFormError(cause instanceof ApiError ? cause.message : 'could not save that key')
+    } finally {
+      setKeyBusy(false)
+    }
+  }
+
+  const clearKey = async () => {
+    if (!draft || !draft.existing || keyBusy) return
+    setKeyBusy(true)
+    setFormError(null)
+    setTestResult(null)
+    try {
+      const result = await api.clearProviderSecret(draft.id)
+      setDraft((current) =>
+        current ? { ...current, has_saved_secret: result.has_saved_secret } : current,
+      )
+      await reload()
+    } catch (cause) {
+      setFormError(cause instanceof ApiError ? cause.message : 'could not clear that key')
+    } finally {
+      setKeyBusy(false)
+    }
+  }
+
+  // One real completion against the default (or chosen) model — the only check that
+  // exercises the resolved key end to end. Never surfaces anything but ok/model/latency.
+  const test = async () => {
+    if (!draft || !draft.existing || testing) return
+    setTesting(true)
+    setTestResult(null)
+    try {
+      const result = await api.testProvider(draft.id, draft.model || undefined)
+      setTestResult({ ok: true, text: `${result.model} answered in ${result.latency_ms} ms` })
+    } catch (cause) {
+      setTestResult({
+        ok: false,
+        text: cause instanceof ApiError ? cause.message : 'the test call could not be made',
+      })
+    } finally {
+      setTesting(false)
     }
   }
 
@@ -923,10 +999,30 @@ function Providers() {
               >
                 {discovering ? 'Asking the endpoint…' : 'Discover models'}
               </button>
+              <button
+                type="button"
+                className="button ghost"
+                onClick={() => void test()}
+                disabled={!draft.existing || testing || draft.models.length === 0}
+                title={
+                  draft.existing
+                    ? `Make one real call to ${draft.model || 'the default model'} and time it`
+                    : 'Save the profile first — the test calls the endpoint with its resolved key'
+                }
+              >
+                {testing ? 'Calling the model…' : 'Test'}
+              </button>
               {!draft.existing ? (
                 <span className="muted">Discovery needs a saved profile with its secret.</span>
               ) : null}
             </div>
+
+            {testResult ? (
+              <p className={`test-result ${testResult.ok ? 'good' : 'bad'}`} role="status">
+                {testResult.ok ? '✓ OK — ' : '✕ '}
+                {testResult.text}
+              </p>
+            ) : null}
 
             {found ? (
               <div className="discovered">
@@ -987,7 +1083,8 @@ function Providers() {
               />
               <small>
                 The name of an environment variable. The value is read server-side and never
-                stored or returned.
+                stored or returned. An ops-provisioned variable takes precedence over a key
+                pasted below.
               </small>
             </label>
             <label className="field">
@@ -1000,6 +1097,52 @@ function Providers() {
               />
             </label>
           </div>
+
+          {draft.existing ? (
+            <label className="field">
+              <span>API key</span>
+              <div className="key-entry">
+                <input
+                  type="password"
+                  value={keyInput}
+                  onChange={(event) => setKeyInput(event.target.value)}
+                  placeholder={
+                    draft.has_saved_secret ? 'A key is stored — paste to replace it' : 'Paste a key to store it'
+                  }
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <button
+                  type="button"
+                  className="button"
+                  onClick={() => void saveKey()}
+                  disabled={!keyInput.trim() || keyBusy}
+                >
+                  {keyBusy ? 'Working…' : 'Save key'}
+                </button>
+                {draft.has_saved_secret ? (
+                  <button
+                    type="button"
+                    className="button ghost danger"
+                    onClick={() => void clearKey()}
+                    disabled={keyBusy}
+                  >
+                    Clear key
+                  </button>
+                ) : null}
+              </div>
+              <small>
+                {draft.has_saved_secret
+                  ? 'A key is stored in the server’s protected file — it never leaves the server and is never shown again. Save a new one to replace it, or clear it to fall back to the reference above.'
+                  : 'Paste a key to store it in the server’s protected file, so it need not be placed on the host by hand. It goes only there — never the database, an API response, or a log.'}
+              </small>
+            </label>
+          ) : (
+            <p className="field-note">
+              Save the profile first, then paste and store an API key here — the store is keyed
+              by the profile id.
+            </p>
+          )}
 
           <label className="check">
             <input

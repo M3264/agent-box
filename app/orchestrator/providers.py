@@ -35,6 +35,7 @@ from typing import Any, Awaitable, Callable, Protocol
 
 import httpx
 
+from app import secret_store
 from app.config import settings
 from app.db import Database
 from app.logging_setup import get_logger
@@ -397,16 +398,35 @@ def parse_json_response(text: str) -> Any:
 
 
 def resolve_secret(secret_ref: str | None, profile_id: str) -> str | None:
-    """Resolve a secret by reference. Never logs or returns it via the API."""
+    """Resolve a provider's secret, in order: the environment, the app secrets file (a
+    key pasted in the Settings form), then the codex config.
+
+    Keyed by ``profile_id`` as well as ``secret_ref`` so a provider added on the website
+    — which may name no environment variable at all — still authenticates from its pasted
+    key. The environment still wins, so an ops-provisioned var overrides a pasted key.
+
+    Never logs the value or returns it via the API. Returns None when the provider needs
+    no secret (no ``secret_ref`` named and nothing saved); raises ``ProviderConfigError``
+    only when a ``secret_ref`` is named but resolves nowhere.
+    """
+    # 1. Environment — an ops-provisioned var wins over everything below it.
+    if secret_ref:
+        for key in (secret_ref, secret_ref.upper(), f"AGENT_HUB_{secret_ref.upper()}"):
+            value = os.environ.get(key, "").strip()
+            if value:
+                return value
+
+    # 2. The app secrets file — a key pasted on the website, stored at mode 0600 and
+    #    keyed by provider id, so it resolves even for a profile that names no secret_ref.
+    saved = secret_store.get_secret(profile_id)
+    if saved:
+        return saved
+
+    # A provider that names no secret and has none saved simply needs no auth.
     if not secret_ref:
         return None
 
-    for key in (secret_ref, secret_ref.upper(), f"AGENT_HUB_{secret_ref.upper()}"):
-        value = os.environ.get(key, "").strip()
-        if value:
-            return value
-
-    # Fallback: the codex config this deployment already had in place.
+    # 3. Fallback: the codex config this deployment already had in place.
     config = settings.codex_config
     if config.exists():
         try:
@@ -982,6 +1002,18 @@ class ProviderPool:
         if key not in self._profiles:
             self._profiles[key] = await load_profile(self._db, key)
         return self._profiles[key]
+
+    def set_default_provider(self, provider_id: str | None) -> None:
+        """Repoint the job-default provider mid-run.
+
+        ``resolve_choice`` substitutes this id for any agent with no explicit assignment,
+        and ``get`` builds a fresh adapter for the new ``(provider, model)`` on demand — so
+        switching this between phases switches every agent that inherits the job default,
+        at the next phase. Editing the *same* id's profile fields is still not picked up:
+        profiles cache for the pool's life (the guarantee ``profile`` documents above), so
+        switch to a different provider id rather than editing one in place.
+        """
+        self._default_provider_id = provider_id
 
     async def get(self, provider_id: str | None = None, model: str | None = None) -> Provider:
         """An adapter for one ``(provider, model)`` pair.

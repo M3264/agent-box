@@ -33,6 +33,9 @@ static/assets/*.map
 # be committed; it is generated on first start and persisted here at mode 0600. The
 # data/*.db* globs above do not cover a .json file, so it is named explicitly.
 data/vapid.json
+# Provider API keys pasted in the Settings form, stored at mode 0600. A secret value,
+# so it must never be committed; same reasoning as vapid.json — the .db* globs miss it.
+data/provider_secrets.json
 
 # TypeScript incremental build cache
 web/tsconfig.tsbuildinfo
